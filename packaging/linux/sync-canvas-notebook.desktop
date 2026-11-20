@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SyncCanvas Notebook
+Name[zh_CN]=SyncCanvas 三端共享画板
+Comment=Cross-platform real-time shared whiteboard and multi-page notebook
+Comment[zh_CN]=电脑、平板与手机三端实时共用同一画板的多页笔记本
+Exec=sync-canvas-notebook %U
+Icon=sync-canvas-notebook
+Terminal=false
+Categories=Office;Utility;Graphics;Education;
+Keywords=notebook;whiteboard;drawing;notes;sync;crdt;
+StartupWMClass=sync_canvas_notebook
+StartupNotify=true

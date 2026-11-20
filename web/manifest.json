@@ -1,0 +1,35 @@
+{
+    "name": "SyncCanvas Notebook · 三端共享画板笔记",
+    "short_name": "SyncCanvas",
+    "start_url": ".",
+    "display": "standalone",
+    "background_color": "#F6F7FB",
+    "theme_color": "#4F46E5",
+    "description": "电脑、平板与手机三端实时共用同一画板的多页手写与白板笔记本",
+    "orientation": "any",
+    "prefer_related_applications": false,
+    "icons": [
+        {
+            "src": "icons/Icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-maskable-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "maskable"
+        },
+        {
+            "src": "icons/Icon-maskable-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "maskable"
+        }
+    ]
+}
