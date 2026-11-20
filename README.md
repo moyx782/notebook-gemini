@@ -14,7 +14,7 @@
   - 支持多笔记本与多页树状管理、关键字搜索、空白 / 方格 / 点阵 / 横线 / **康奈尔笔记模板** 及纸张底色切换。
   - **可交互 Markdown 卡片**：支持标题、加粗、行内代码、引用与 **可点击实时同步的 `- [ ]` / `- [x]` 待办复选框**。
 - **无路由器自组网（随身房主 + BLE 蓝牙引导热点 + UDP 自动发现）**
-  - **随身房主模式**：任意原生端（Android / macOS / iPad）均可在「三端连接」中一键开启「本机当房主」，内置启动同步服务端并推送本地画板快照，无需电脑或命令行。
+  - **随身房主模式**：任意原生端（Android / macOS / Windows / Linux / iPad）均可在「三端连接」中一键开启「本机当房主」，内置启动同步服务端并推送本地画板快照，无需电脑或命令行。
   - **先蓝牙发现，再切热点高速同步**：房主端通过低功耗蓝牙（BLE GATT）广播房间信息与热点凭证（Android 端支持一键拉起本地直连热点或分享个人热点凭证）；附近 Android 端可在雷达中点击「秒连加入」自动接入热点并绑定网络通道，iPad/Mac 端通过 CoreBluetooth 发现后展示一键复制热点名密码弹窗并自动续连。
   - **零配置 UDP 雷达**：处于同一 Wi-Fi 或同一手机个人热点下时，无需任何蓝牙/定位权限即可通过 UDP `48788` 端口自动发现附近共享画板。
 - **三端自适应交互体验**
@@ -97,6 +97,22 @@ flutter run -d <你的iPad或iPhone设备ID>
    ./scripts/package_linux_docker.sh all   # 支持 amd64 / arm64 / all
    ```
 
+### 5. Windows 桌面端（`.exe` 安装向导包 / `.zip` 免安装绿色版，支持 `x64` & `arm64`）
+
+1. **下载安装包或绿色便携版**（可从 GitHub Releases 下载对应架构产物）：
+   - **标准安装向导（推荐，`.exe`）**：运行 `SyncCanvas_Notebook_Setup_1.0.0_windows_x64.exe`（Windows ARM 设备请选择 `windows_arm64`），支持免管理员按用户安装并自动创建桌面与开始菜单快捷方式。
+   - **免安装绿色便携版（`.zip`）**：解压 `SyncCanvas_Notebook-1.0.0-windows-x64-portable.zip` 后直接双击 `sync_canvas_notebook.exe` 运行（已随包附带 MSVC C++ 运行时 DLL）。
+2. **在 Windows 本机一键打包双格式**：
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_packages.ps1
+   # 输出位于 dist\windows\（包含 .exe 安装包、.zip 绿色版与 SHA256SUMS）
+   ```
+3. **源码直连运行（Windows 10/11 + Visual Studio C++ 工具链）**：
+   ```powershell
+   flutter config --enable-windows-desktop
+   flutter run -d windows
+   ```
+
 ---
 
 ## 桌面端快捷键
@@ -127,9 +143,12 @@ flutter run -d <你的iPad或iPhone设备ID>
 │   ├── canvas/               # 压感几何引擎、双层画板 Painter、手势处理与可交互卡片层
 │   └── ui/                   # 三端自适应壳层、目录侧栏、工具栏、在线状态栏与扫码弹窗
 ├── test/                     # 三端自适应界面与同步测试
-├── packaging/linux/          # Linux .desktop / SVG 图标与多架构 Dockerfile
-├── scripts/                  # Linux deb / rpm / AppImage 打包脚本
-├── .github/workflows/        # GitHub Actions 双架构 Linux 自动构建发布流
+├── windows/                  # Windows 桌面端 Win32/C++ 原生工程壳层
+├── packaging/
+│   ├── linux/                # Linux .desktop / SVG 图标与多架构 Dockerfile
+│   └── windows/              # Windows Inno Setup (.exe) 安装包脚本配置
+├── scripts/                  # Linux (.deb/.rpm/AppImage) 与 Windows (.exe/.zip) 打包脚本
+├── .github/workflows/        # GitHub Actions Linux 与 Windows 双架构自动构建发布流
 └── start.sh                  # 一键构建与启动脚本
 ```
 

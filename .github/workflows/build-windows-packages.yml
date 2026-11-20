@@ -1,0 +1,128 @@
+name: Build Windows Packages (exe, zip)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: pwsh
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure native PROCESSOR_ARCHITECTURE on ARM64
+        if: matrix.arch == 'arm64'
+        run: |
+          Write-Host "Current PROCESSOR_ARCHITECTURE: $env:PROCESSOR_ARCHITECTURE"
+          "PROCESSOR_ARCHITECTURE=ARM64" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Flutter SDK (stable)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $flutterDir = Join-Path $env:RUNNER_TEMP 'flutter'
+          if (Test-Path $flutterDir) {
+            Remove-Item -Recurse -Force $flutterDir
+          }
+          git clone https://github.com/flutter/flutter.git -b stable --depth 1 $flutterDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to clone Flutter SDK (exit code $LASTEXITCODE)"
+          }
+          (Join-Path $flutterDir 'bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          (Join-Path $flutterDir 'bin\cache\dart-sdk\bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify Flutter & run tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          function Exec([string]$cmd, [string[]]$argsList) {
+            Write-Host "==> $cmd $($argsList -join ' ')"
+            & $cmd @argsList
+            if ($LASTEXITCODE -ne 0) {
+              throw "Command failed ($LASTEXITCODE): $cmd $($argsList -join ' ')"
+            }
+          }
+
+          Exec 'flutter' @('--suppress-analytics', '--version')
+          Exec 'flutter' @('--suppress-analytics', 'pub', 'get')
+          Exec 'flutter' @('--suppress-analytics', 'analyze', '--no-fatal-infos')
+          Exec 'flutter' @('--suppress-analytics', 'test')
+
+          Exec 'dart' @('--suppress-analytics', 'pub', 'get', '-C', 'packages/notebook_core')
+          Push-Location 'packages/notebook_core'
+          try {
+            Exec 'dart' @('--suppress-analytics', 'analyze')
+            Exec 'dart' @('--suppress-analytics', 'test')
+          } finally {
+            Pop-Location
+          }
+
+          Exec 'dart' @('--suppress-analytics', 'pub', 'get', '-C', 'server')
+          Push-Location 'server'
+          try {
+            Exec 'dart' @('--suppress-analytics', 'analyze')
+            Exec 'dart' @('--suppress-analytics', 'test')
+          } finally {
+            Pop-Location
+          }
+
+      - name: Build Windows Installer (.exe) & Portable (.zip)
+        run: |
+          ./scripts/build_windows_packages.ps1 -Arch ${{ matrix.arch }}
+
+      - name: Inspect generated packages
+        run: |
+          Get-ChildItem dist/windows/ | Format-Table Name, Length -AutoSize
+          Get-Content "dist/windows/SHA256SUMS-windows-${{ matrix.arch }}.txt"
+
+      - name: Upload Windows packages artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages-${{ matrix.arch }}
+          path: dist/windows/*
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Windows Release Assets
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download x64 packages
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-packages-x64
+          path: release-assets
+
+      - name: Download arm64 packages
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-packages-arm64
+          path: release-assets
+
+      - name: Publish Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

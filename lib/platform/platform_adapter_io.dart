@@ -96,6 +96,27 @@ class IoPlatformAdapter implements PlatformAdapter {
       } catch (_) {}
     }
 
+    if (Platform.isWindows) {
+      final localAppData = Platform.environment['LOCALAPPDATA']?.trim();
+      final appData = Platform.environment['APPDATA']?.trim();
+      final userProfile = Platform.environment['USERPROFILE']?.trim();
+      final sep = Platform.pathSeparator;
+      final winBase = (localAppData != null && localAppData.isNotEmpty)
+          ? Directory('$localAppData${sep}SyncCanvasNotebook')
+          : (appData != null && appData.isNotEmpty)
+              ? Directory('$appData${sep}SyncCanvasNotebook')
+              : (userProfile != null && userProfile.isNotEmpty)
+                  ? Directory('$userProfile$sep.sync_canvas_notebook')
+                  : Directory(
+                      '${Directory.systemTemp.path}${sep}sync_canvas_notebook',
+                    );
+      try {
+        await winBase.create(recursive: true);
+        _cacheDir = winBase;
+        return winBase;
+      } catch (_) {}
+    }
+
     final home = Platform.environment['HOME'];
     final base = home != null && home.isNotEmpty
         ? Directory('$home/.sync_canvas_notebook')
@@ -120,7 +141,8 @@ class IoPlatformAdapter implements PlatformAdapter {
   bool get isWeb => false;
 
   @override
-  bool get canPickImage => Platform.isAndroid || Platform.isLinux;
+  bool get canPickImage =>
+      Platform.isAndroid || Platform.isLinux || Platform.isWindows;
 
   @override
   bool get canScanQrCode => Platform.isAndroid;
@@ -133,7 +155,8 @@ class IoPlatformAdapter implements PlatformAdapter {
       Platform.isAndroid ||
       Platform.isMacOS ||
       Platform.isIOS ||
-      Platform.isLinux;
+      Platform.isLinux ||
+      Platform.isWindows;
 
   @override
   bool get canManageHotspot => Platform.isAndroid;
@@ -161,6 +184,9 @@ class IoPlatformAdapter implements PlatformAdapter {
     }
     if (Platform.isLinux) {
       return host.isEmpty ? 'Linux 桌面端' : '$host · Linux';
+    }
+    if (Platform.isWindows) {
+      return host.isEmpty ? 'Windows 桌面端' : '$host · Windows';
     }
     return host.isEmpty ? '桌面端' : host;
   }
@@ -247,6 +273,49 @@ class IoPlatformAdapter implements PlatformAdapter {
       if (path == null || path.isEmpty) return null;
       return loadImagePathAsDataUrl(path);
     }
+    if (Platform.isWindows) {
+      final path = await _pickWindowsImageFilePath();
+      if (path == null || path.isEmpty) return null;
+      return loadImagePathAsDataUrl(path);
+    }
+    return null;
+  }
+
+  Future<String?> _pickWindowsImageFilePath() async {
+    const script = r'''
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+$owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }
+$dlg = New-Object System.Windows.Forms.OpenFileDialog
+$dlg.Title = 'Select Image for SyncCanvas'
+$dlg.Filter = 'Image Files (*.png;*.jpg;*.jpeg;*.webp;*.gif)|*.png;*.jpg;*.jpeg;*.webp;*.gif|All Files (*.*)|*.*'
+try {
+  if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::Out.Write($dlg.FileName)
+  }
+} finally {
+  $dlg.Dispose()
+  $owner.Dispose()
+}
+''';
+    try {
+      final res = await Process.run(
+        'powershell.exe',
+        const <String>[
+          '-NoProfile',
+          '-NonInteractive',
+          '-Sta',
+          '-Command',
+          script,
+        ],
+        stdoutEncoding: utf8,
+        stderrEncoding: utf8,
+      );
+      if (res.exitCode == 0) {
+        final chosen = (res.stdout as String).trim();
+        if (chosen.isNotEmpty) return chosen;
+      }
+    } catch (_) {}
     return null;
   }
 
@@ -315,7 +384,7 @@ class IoPlatformAdapter implements PlatformAdapter {
   Future<String?> saveExportFile(String filename, String content) async {
     try {
       final dir = await _ensureCacheDir();
-      final out = File('${dir.path}/$filename');
+      final out = File('${dir.path}${Platform.pathSeparator}$filename');
       await out.writeAsString(content, flush: true);
       return out.path;
     } catch (_) {
