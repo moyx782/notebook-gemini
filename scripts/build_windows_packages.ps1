@@ -156,12 +156,14 @@ function Find-Iscc {
   if ($cmd) {
     return $cmd.Source
   }
+  $tempBase = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
   $localPrograms = if ($env:LOCALAPPDATA) {
     Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'
   } else {
     $null
   }
   $candidates = @(
+    (Join-Path $tempBase 'inno6\ISCC.exe'),
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
     "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
     $localPrograms
@@ -171,16 +173,12 @@ function Find-Iscc {
 
 $IsccPath = Find-Iscc
 if (-not $IsccPath) {
-  Write-Host "==> ISCC.exe not found locally; installing Inno Setup 6.7.4 into user profile..."
+  Write-Host "==> ISCC.exe not found locally; installing Inno Setup 6.7.4..."
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   $innoUrl = 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe'
   $tempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
   $setupTmp = Join-Path $tempRoot 'innosetup-6.7.4.exe'
-  $innoDir = if ($env:LOCALAPPDATA) {
-    Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6'
-  } else {
-    Join-Path $tempRoot 'Inno Setup 6'
-  }
+  $innoDir = Join-Path $tempRoot 'inno6'
 
   Invoke-WebRequest -Uri $innoUrl -OutFile $setupTmp -UseBasicParsing
   $proc = Start-Process -FilePath $setupTmp -ArgumentList @(

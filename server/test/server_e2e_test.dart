@@ -24,6 +24,8 @@ class _TestPeerClient {
       StreamController<SyncMessage>.broadcast();
 
   WebSocket? _socket;
+  StreamSubscription<dynamic>? _sub;
+  bool _disposed = false;
   final Map<String, PeerPresence> knownPeers = <String, PeerPresence>{};
   final List<LiveStrokeFrame> liveStrokes = <LiveStrokeFrame>[];
   final List<SyncMessage> laserMessages = <SyncMessage>[];
@@ -31,58 +33,66 @@ class _TestPeerClient {
   Stream<SyncMessage> get messages => _events.stream;
 
   Future<void> connect(int port, {String roomId = 'team-room'}) async {
+    await _sub?.cancel();
+    _sub = null;
+
     final socket = await WebSocket.connect('ws://127.0.0.1:$port/ws?room=$roomId');
     _socket = socket;
 
     final welcomeCompleter = Completer<void>();
 
-    socket.listen((dynamic raw) {
-      if (raw is! String) return;
-      final msg = SyncMessage.decode(raw);
-      switch (msg.type) {
-        case SyncMessageType.welcome:
-          final snapshot = msg.payload['snapshot'];
-          if (snapshot is Map) {
-            doc.mergeSnapshotJson(Map<String, dynamic>.from(snapshot));
-          }
-          knownPeers.clear();
-          for (final p in msg.readPeersList()) {
-            if (p.peerId != peerId) {
+    _sub = socket.listen(
+      (dynamic raw) {
+        if (_disposed || raw is! String) return;
+        final msg = SyncMessage.decode(raw);
+        switch (msg.type) {
+          case SyncMessageType.welcome:
+            final snapshot = msg.payload['snapshot'];
+            if (snapshot is Map) {
+              doc.mergeSnapshotJson(Map<String, dynamic>.from(snapshot));
+            }
+            knownPeers.clear();
+            for (final p in msg.readPeersList()) {
+              if (p.peerId != peerId) {
+                knownPeers[p.peerId] = p;
+              }
+            }
+            if (!welcomeCompleter.isCompleted) {
+              welcomeCompleter.complete();
+            }
+            break;
+          case SyncMessageType.opBatch:
+            doc.applyOps(msg.readOps());
+            break;
+          case SyncMessageType.presence:
+            final p = msg.readPeer();
+            if (p != null && p.peerId != peerId) {
               knownPeers[p.peerId] = p;
             }
-          }
-          if (!welcomeCompleter.isCompleted) {
-            welcomeCompleter.complete();
-          }
-          break;
-        case SyncMessageType.opBatch:
-          doc.applyOps(msg.readOps());
-          break;
-        case SyncMessageType.presence:
-          final p = msg.readPeer();
-          if (p != null && p.peerId != peerId) {
-            knownPeers[p.peerId] = p;
-          }
-          break;
-        case SyncMessageType.strokeStream:
-          final frame = msg.readStrokeFrame();
-          if (frame != null) liveStrokes.add(frame);
-          break;
-        case SyncMessageType.laserStream:
-          laserMessages.add(msg);
-          break;
-        case SyncMessageType.peerLeft:
-          final leftId = msg.payload['peerId'] as String?;
-          if (leftId != null) knownPeers.remove(leftId);
-          break;
-        case SyncMessageType.hello:
-        case SyncMessageType.ping:
-        case SyncMessageType.pong:
-        case SyncMessageType.error:
-          break;
-      }
-      _events.add(msg);
-    });
+            break;
+          case SyncMessageType.strokeStream:
+            final frame = msg.readStrokeFrame();
+            if (frame != null) liveStrokes.add(frame);
+            break;
+          case SyncMessageType.laserStream:
+            laserMessages.add(msg);
+            break;
+          case SyncMessageType.peerLeft:
+            final leftId = msg.payload['peerId'] as String?;
+            if (leftId != null) knownPeers.remove(leftId);
+            break;
+          case SyncMessageType.hello:
+          case SyncMessageType.ping:
+          case SyncMessageType.pong:
+          case SyncMessageType.error:
+            break;
+        }
+        if (!_disposed && !_events.isClosed) {
+          _events.add(msg);
+        }
+      },
+      onError: (_) {},
+    );
 
     final hello = SyncMessage.hello(
       roomId: roomId,
@@ -136,13 +146,21 @@ class _TestPeerClient {
   }
 
   Future<void> disconnect() async {
-    await _socket?.close();
+    final sub = _sub;
+    _sub = null;
+    await sub?.cancel();
+    try {
+      await _socket?.close();
+    } catch (_) {}
     _socket = null;
   }
 
   Future<void> dispose() async {
+    _disposed = true;
     await disconnect();
-    await _events.close();
+    if (!_events.isClosed) {
+      await _events.close();
+    }
   }
 }
 
@@ -432,7 +450,9 @@ void main() {
       } finally {
         await lateClient.dispose();
         await restarted.close();
-        await tempRoot.delete(recursive: true);
+        try {
+          await tempRoot.delete(recursive: true);
+        } catch (_) {}
       }
     },
   );
