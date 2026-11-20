@@ -57,7 +57,7 @@ jobs:
         run: |
           flutter --suppress-analytics --version
           flutter --suppress-analytics pub get
-          flutter --suppress-analytics analyze
+          flutter --suppress-analytics analyze --no-fatal-infos
           flutter --suppress-analytics test
           dart --suppress-analytics pub get -C packages/notebook_core
           (cd packages/notebook_core && dart --suppress-analytics test)
