@@ -469,6 +469,10 @@ class CrdtDocument {
       deleted: r.raw('deleted') as bool? ?? false,
       updatedAtMs: r.maxWallTimeMs(),
       locked: r.raw('locked') as bool? ?? false,
+      sourceId: r.raw('sourceId') as String? ?? '',
+      targetId: r.raw('targetId') as String? ?? '',
+      semanticColor:
+          MindFlowColor.fromName(r.raw('semanticColor') as String?),
     );
   }
 

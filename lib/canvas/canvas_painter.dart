@@ -58,6 +58,7 @@ class CommittedCanvasPainter extends CustomPainter {
     this.revision = 0,
     this.showPageGuide = false,
     this.paintPaper = true,
+    this.paintGraph = false,
     this.paintInk = true,
   });
 
@@ -69,6 +70,7 @@ class CommittedCanvasPainter extends CustomPainter {
   final int revision;
   final bool showPageGuide;
   final bool paintPaper;
+  final bool paintGraph;
   final bool paintInk;
 
   @override
@@ -103,6 +105,32 @@ class CommittedCanvasPainter extends CustomPainter {
       }
     }
 
+    if (paintGraph) {
+      final activeEls = elements.where((e) => !e.deleted).toList();
+      final byId = <String, CanvasElementModel>{
+        for (final e in activeEls) e.id: e,
+      };
+      for (final el in activeEls) {
+        if (el.kind == ElementKind.cluster) {
+          _paintCluster(canvas, el, zoom);
+          if (el.id == selectedElementId) {
+            _paintSelectionOverlay(canvas, el);
+          }
+        }
+      }
+      for (final el in activeEls) {
+        if (el.kind == ElementKind.connector) {
+          _paintConnector(
+            canvas,
+            el,
+            byId,
+            zoom,
+            selected: el.id == selectedElementId,
+          );
+        }
+      }
+    }
+
     if (paintInk) {
       for (final el in elements) {
         if (el.deleted) continue;
@@ -112,6 +140,8 @@ class CommittedCanvasPainter extends CustomPainter {
           _paintHighlighter(canvas, el);
         } else if (el.kind == ElementKind.shape) {
           _paintShape(canvas, el);
+        } else {
+          continue;
         }
 
         if (el.id == selectedElementId) {
@@ -506,6 +536,165 @@ class CommittedCanvasPainter extends CustomPainter {
     tp.paint(canvas, pos);
   }
 
+  void _paintCluster(Canvas canvas, CanvasElementModel el, double zoom) {
+    final sem = el.semanticColor;
+    final borderColor = Color(
+      el.colorValue != 0 ? el.colorValue : sem.borderArgb,
+    );
+    final fillColor = Color(
+      el.fillColorValue != 0 ? el.fillColorValue : sem.fillArgb,
+    );
+    final textColor = Color(sem.textArgb);
+    final rect = Rect.fromLTWH(el.x, el.y, el.width, el.height);
+    final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(16));
+
+    final bgTint = sem == MindFlowColor.neutral
+        ? borderColor.withValues(alpha: 0.08)
+        : fillColor.withValues(alpha: 0.34);
+    canvas.drawRRect(rrect, Paint()..color = bgTint);
+
+    final dashedPaint = Paint()
+      ..color = borderColor.withValues(alpha: 0.78)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = (el.strokeWidth > 0 ? el.strokeWidth : 1.8)
+      ..strokeCap = StrokeCap.round;
+    _drawDashedPath(canvas, Path()..addRRect(rrect), dashedPaint);
+
+    final title = el.text.trim().isEmpty ? '主题分组' : el.text.trim();
+    final tp = TextPainter(
+      text: TextSpan(
+        text: title,
+        style: TextStyle(
+          color: textColor,
+          fontSize: 12.0,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+      maxLines: 1,
+      ellipsis: '…',
+    )..layout(maxWidth: math.max(60.0, el.width - 36.0));
+
+    final headerRect = RRect.fromRectAndRadius(
+      Rect.fromLTWH(el.x + 12, el.y + 8, tp.width + 18, 24),
+      const Radius.circular(999),
+    );
+    canvas.drawRRect(
+      headerRect,
+      Paint()..color = Colors.white.withValues(alpha: 0.92),
+    );
+    canvas.drawRRect(
+      headerRect,
+      Paint()
+        ..color = borderColor.withValues(alpha: 0.6)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.1,
+    );
+    tp.paint(canvas, Offset(el.x + 21, el.y + 8 + (24 - tp.height) * 0.5));
+  }
+
+  void _paintConnector(
+    Canvas canvas,
+    CanvasElementModel el,
+    Map<String, CanvasElementModel> byId,
+    double zoom, {
+    required bool selected,
+  }) {
+    final curve = computeConnectorCurve(el, byId);
+    final sx = curve?.sx ?? el.x;
+    final sy = curve?.sy ?? el.y;
+    final tx = curve?.tx ?? (el.x + el.width);
+    final ty = curve?.ty ?? (el.y + el.height);
+    final c1x = curve?.c1x ?? (sx + (tx - sx) * 0.45);
+    final c1y = curve?.c1y ?? sy;
+    final c2x = curve?.c2x ?? (tx - (tx - sx) * 0.45);
+    final c2y = curve?.c2y ?? ty;
+    final midX = curve?.midX ?? ((sx + tx) * 0.5);
+    final midY = curve?.midY ?? ((sy + ty) * 0.5);
+
+    final color = Color(
+      el.colorValue != 0 ? el.colorValue : el.semanticColor.borderArgb,
+    );
+    final strokeW = el.strokeWidth > 0 ? el.strokeWidth : 2.4;
+
+    final path = Path()
+      ..moveTo(sx, sy)
+      ..cubicTo(c1x, c1y, c2x, c2y, tx, ty);
+
+    if (selected) {
+      canvas.drawPath(
+        path,
+        Paint()
+          ..color = const Color(0xFF4F46E5).withValues(alpha: 0.28)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = strokeW + 6.0 / math.max(0.5, zoom)
+          ..strokeCap = StrokeCap.round,
+      );
+    }
+
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = strokeW
+        ..strokeCap = StrokeCap.round
+        ..isAntiAlias = true,
+    );
+
+    final tangentDir = (Offset(tx, ty) - Offset(c2x, c2y)).distanceSquared > 1.0
+        ? Offset(tx - c2x, ty - c2y)
+        : Offset(tx - sx, ty - sy);
+    paintMindFlowArrowHead(
+      canvas,
+      Offset(tx, ty),
+      tangentDir,
+      selected ? const Color(0xFF4F46E5) : color,
+      size: 10.5,
+    );
+
+    final label = el.text.trim();
+    if (label.isNotEmpty) {
+      final tp = TextPainter(
+        text: TextSpan(
+          text: label,
+          style: TextStyle(
+            color: selected ? const Color(0xFF312E81) : const Color(0xFF334155),
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+        maxLines: 1,
+      )..layout(maxWidth: 160.0);
+
+      final capsuleRect = RRect.fromRectAndRadius(
+        Rect.fromCenter(
+          center: Offset(midX, midY),
+          width: tp.width + 16,
+          height: tp.height + 8,
+        ),
+        const Radius.circular(999),
+      );
+      canvas.drawRRect(
+        capsuleRect,
+        Paint()..color = Colors.white.withValues(alpha: 0.96),
+      );
+      canvas.drawRRect(
+        capsuleRect,
+        Paint()
+          ..color = (selected ? const Color(0xFF4F46E5) : color)
+              .withValues(alpha: 0.55)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.2,
+      );
+      tp.paint(
+        canvas,
+        Offset(midX - tp.width * 0.5, midY - tp.height * 0.5),
+      );
+    }
+  }
+
   void _paintStroke(Canvas canvas, CanvasElementModel el) {
     final path = _cachedStrokeRibbonPath(el);
     canvas.drawPath(
@@ -579,6 +768,7 @@ class CommittedCanvasPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant CommittedCanvasPainter oldDelegate) {
     if (paintPaper != oldDelegate.paintPaper ||
+        paintGraph != oldDelegate.paintGraph ||
         paintInk != oldDelegate.paintInk ||
         panOffset != oldDelegate.panOffset ||
         zoom != oldDelegate.zoom) {
@@ -592,7 +782,7 @@ class CommittedCanvasPainter extends CustomPainter {
         return true;
       }
     }
-    if (paintInk) {
+    if (paintInk || paintGraph) {
       if (revision != oldDelegate.revision ||
           page?.id != oldDelegate.page?.id ||
           selectedElementId != oldDelegate.selectedElementId ||
@@ -602,6 +792,49 @@ class CommittedCanvasPainter extends CustomPainter {
     }
     return false;
   }
+}
+
+void _drawDashedPath(
+  Canvas canvas,
+  Path path,
+  Paint paint, {
+  double dashLen = 8.0,
+  double gapLen = 5.0,
+}) {
+  for (final metric in path.computeMetrics()) {
+    var dist = 0.0;
+    while (dist < metric.length) {
+      final end = math.min(metric.length, dist + dashLen);
+      canvas.drawPath(metric.extractPath(dist, end), paint);
+      dist += dashLen + gapLen;
+    }
+  }
+}
+
+void paintMindFlowArrowHead(
+  Canvas canvas,
+  Offset tip,
+  Offset direction,
+  Color color, {
+  double size = 10.0,
+}) {
+  final angle = direction.distanceSquared > 0.01
+      ? math.atan2(direction.dy, direction.dx)
+      : 0.0;
+  final wingA = Offset(
+    tip.dx - size * math.cos(angle - math.pi / 6),
+    tip.dy - size * math.sin(angle - math.pi / 6),
+  );
+  final wingB = Offset(
+    tip.dx - size * math.cos(angle + math.pi / 6),
+    tip.dy - size * math.sin(angle + math.pi / 6),
+  );
+  final arrowPath = Path()
+    ..moveTo(tip.dx, tip.dy)
+    ..lineTo(wingA.dx, wingA.dy)
+    ..lineTo(wingB.dx, wingB.dy)
+    ..close();
+  canvas.drawPath(arrowPath, Paint()..color = color);
 }
 
 void paintShapeGeometry({
@@ -932,6 +1165,77 @@ class LiveOverlayPainter extends CustomPainter {
           4.5,
           Paint()..color = Colors.white.withValues(alpha: headAlpha),
         );
+      }
+    }
+
+    // 4.5. MindFlow live cluster & connector creation previews
+    final activeCluster = controller.activeCluster;
+    if (activeCluster != null) {
+      final rect = Rect.fromLTRB(
+        math.min(activeCluster.startX, activeCluster.currentX),
+        math.min(activeCluster.startY, activeCluster.currentY),
+        math.max(activeCluster.startX, activeCluster.currentX),
+        math.max(activeCluster.startY, activeCluster.currentY),
+      );
+      final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(16));
+      final previewColor = Color(activeCluster.colorValue);
+      canvas.drawRRect(
+        rrect,
+        Paint()..color = previewColor.withValues(alpha: 0.12),
+      );
+      _drawDashedPath(
+        canvas,
+        Path()..addRRect(rrect),
+        Paint()
+          ..color = previewColor
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.0,
+      );
+    }
+
+    final activeConnector = controller.activeConnector;
+    if (activeConnector != null) {
+      final start = Offset(activeConnector.startX, activeConnector.startY);
+      final end = Offset(activeConnector.currentX, activeConnector.currentY);
+      final dx = (end.dx - start.dx) * 0.45;
+      final c1 = Offset(start.dx + dx, start.dy);
+      final c2 = Offset(end.dx - dx, end.dy);
+      final color = Color(activeConnector.colorValue);
+      final path = Path()
+        ..moveTo(start.dx, start.dy)
+        ..cubicTo(c1.dx, c1.dy, c2.dx, c2.dy, end.dx, end.dy);
+      canvas.drawPath(
+        path,
+        Paint()
+          ..color = color
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.6
+          ..strokeCap = StrokeCap.round,
+      );
+      paintMindFlowArrowHead(
+        canvas,
+        end,
+        (end - c2).distanceSquared > 1.0 ? end - c2 : end - start,
+        color,
+        size: 11.0,
+      );
+      final hoveredId = activeConnector.hoveredTargetId;
+      if (hoveredId != null) {
+        final target = controller.doc.getElement(hoveredId);
+        if (target != null && !target.deleted) {
+          final ring = RRect.fromRectAndRadius(
+            Rect.fromLTWH(target.x, target.y, target.width, target.height)
+                .inflate(4.0),
+            const Radius.circular(14),
+          );
+          canvas.drawRRect(
+            ring,
+            Paint()
+              ..color = const Color(0xFF4F46E5)
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 2.6,
+          );
+        }
       }
     }
 

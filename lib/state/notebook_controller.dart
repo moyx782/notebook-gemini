@@ -18,6 +18,9 @@ enum CanvasTool {
   pen('钢笔', 'P'),
   highlighter('荧光笔', 'H'),
   eraser('橡皮擦', 'E'),
+  token('概念词块', 'N'),
+  connector('因果连线', 'C'),
+  cluster('区域分组', 'B'),
   rectangle('矩形', 'R'),
   ellipse('圆形', 'O'),
   diamond('菱形', 'D'),
@@ -66,6 +69,15 @@ enum ToolbarDock {
   floating('自由悬浮');
 
   const ToolbarDock(this.label);
+  final String label;
+}
+
+enum PdfImportPlacement {
+  newSinglePage('新建单页连续画板'),
+  currentPage('嵌入当前画板页'),
+  newNotebookSinglePage('新建独立笔记本');
+
+  const PdfImportPlacement(this.label);
   final String label;
 }
 
@@ -129,6 +141,42 @@ class ActiveShapePreview {
   double currentY;
   final int colorValue;
   final double strokeWidth;
+}
+
+class ActiveConnectorPreview {
+  ActiveConnectorPreview({
+    required this.sourceId,
+    required this.startX,
+    required this.startY,
+    required this.currentX,
+    required this.currentY,
+    required this.colorValue,
+    this.hoveredTargetId,
+  });
+
+  final String? sourceId;
+  final double startX;
+  final double startY;
+  double currentX;
+  double currentY;
+  final int colorValue;
+  String? hoveredTargetId;
+}
+
+class ActiveClusterPreview {
+  ActiveClusterPreview({
+    required this.startX,
+    required this.startY,
+    required this.currentX,
+    required this.currentY,
+    required this.colorValue,
+  });
+
+  final double startX;
+  final double startY;
+  double currentX;
+  double currentY;
+  final int colorValue;
 }
 
 class JoinBoardOutcome {
@@ -338,6 +386,11 @@ class NotebookController extends ChangeNotifier {
 
   ActiveStrokePreview? _activeStroke;
   ActiveShapePreview? _activeShape;
+  ActiveConnectorPreview? _activeConnector;
+  ActiveClusterPreview? _activeCluster;
+  MindFlowColor _activeMindFlowColor = MindFlowColor.yellow;
+  bool _mindflowMcpReadOnly = true;
+  int _localMindFlowRevision = 1;
 
   final Map<String, PeerPresence> _remotePeers = <String, PeerPresence>{};
   final Map<String, LiveStrokeFrame> _remoteLiveStrokes =
@@ -460,6 +513,11 @@ class NotebookController extends ChangeNotifier {
 
   ActiveStrokePreview? get activeStroke => _activeStroke;
   ActiveShapePreview? get activeShape => _activeShape;
+  ActiveConnectorPreview? get activeConnector => _activeConnector;
+  ActiveClusterPreview? get activeCluster => _activeCluster;
+  MindFlowColor get activeMindFlowColor => _activeMindFlowColor;
+  bool get mindflowMcpReadOnly => _mindflowMcpReadOnly;
+  int get mindflowRevision => _localMindFlowRevision;
   Listenable get livePaintListenable => _livePaintNotifier;
   int get committedInkRevision => _committedInkRevision;
   Map<String, PeerPresence> get remotePeersMap => _remotePeers;
@@ -480,6 +538,7 @@ class NotebookController extends ChangeNotifier {
 
   void _bumpCommittedInk() {
     _committedInkRevision = (_committedInkRevision + 1) & 0x3fffffff;
+    _localMindFlowRevision += 1;
   }
 
   List<PeerPresence> get remotePeers =>
@@ -674,6 +733,8 @@ class NotebookController extends ChangeNotifier {
   void setTool(CanvasTool nextTool) {
     _tool = nextTool;
     _activeLassoPoints.clear();
+    _activeConnector = null;
+    _activeCluster = null;
     if (nextTool != CanvasTool.select) {
       _editingCardId = null;
     }
@@ -682,6 +743,28 @@ class NotebookController extends ChangeNotifier {
     }
     _bumpLivePaint();
     notifyListeners();
+  }
+
+  void setActiveMindFlowColor(MindFlowColor color) {
+    _activeMindFlowColor = color;
+    if (_selectedElementIds.isNotEmpty || _selectedElementId != null) {
+      recolorSelectionSemantic(color);
+      return;
+    }
+    notifyListeners();
+  }
+
+  void setMindFlowMcpReadOnly(bool readOnly) {
+    if (_mindflowMcpReadOnly == readOnly) return;
+    _mindflowMcpReadOnly = readOnly;
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  void _maybePushSelectionPresence() {
+    if (_connectionState == SyncConnectionState.connected && _channel != null) {
+      sendPresence(force: true);
+    }
   }
 
   void setActiveColor(Color color) {
@@ -693,6 +776,13 @@ class NotebookController extends ChangeNotifier {
     if (_selectedElementId != null) {
       final el = _doc.getElement(_selectedElementId!);
       if (el != null && !el.deleted && !el.locked) {
+        if (el.kind == ElementKind.token || el.kind == ElementKind.cluster) {
+          updateElementSemanticColor(
+            el.id,
+            MindFlowColor.fromColorValue(color.toARGB32()),
+          );
+          return;
+        }
         final fieldKey = el.kind == ElementKind.stickyNote
             ? 'fillColorValue'
             : 'colorValue';
@@ -735,6 +825,7 @@ class NotebookController extends ChangeNotifier {
       _editingCardId = null;
     }
     _bumpLivePaint();
+    _maybePushSelectionPresence();
     notifyListeners();
   }
 
@@ -750,6 +841,7 @@ class NotebookController extends ChangeNotifier {
     _editingCardId = null;
     _activeLassoPoints.clear();
     _bumpLivePaint();
+    _maybePushSelectionPresence();
     notifyListeners();
   }
 
@@ -1644,11 +1736,13 @@ class NotebookController extends ChangeNotifier {
     double? width,
     double? height,
   }) {
+    final existing = _doc.getElement(elementId);
+    final isToken = existing?.kind == ElementKind.token;
     final patch = <String, Object?>{};
     if (x != null) patch['x'] = x;
     if (y != null) patch['y'] = y;
-    if (width != null) patch['width'] = math.max(80.0, width);
-    if (height != null) patch['height'] = math.max(60.0, height);
+    if (width != null) patch['width'] = math.max(isToken ? 110.0 : 80.0, width);
+    if (height != null) patch['height'] = math.max(isToken ? 40.0 : 60.0, height);
     if (patch.isEmpty) return;
     _commitPatch(EntityType.element, elementId, patch, recordUndo: false);
   }
@@ -1710,8 +1804,12 @@ class NotebookController extends ChangeNotifier {
     _activeLassoPoints.clear();
 
     if (poly.length >= 3) {
-      for (final el in activeElements) {
-        if (elementMatchesLasso(el, poly)) {
+      final els = activeElements;
+      final byId = <String, CanvasElementModel>{
+        for (final e in els) e.id: e,
+      };
+      for (final el in els) {
+        if (elementMatchesLasso(el, poly, elementsById: byId)) {
           _selectedElementIds.add(el.id);
         }
       }
@@ -1722,6 +1820,7 @@ class NotebookController extends ChangeNotifier {
       _selectedElementId = null;
     }
     _bumpLivePaint();
+    _maybePushSelectionPresence();
     notifyListeners();
   }
 
@@ -1747,6 +1846,30 @@ class NotebookController extends ChangeNotifier {
       final el = _doc.getElement(id);
       if (el != null && !el.deleted && !el.locked) {
         origins[id] = Offset(el.x, el.y);
+      }
+    }
+    return origins;
+  }
+
+  Map<String, Offset> captureClusterDragOrigins(String clusterId) {
+    final cluster = _doc.getElement(clusterId);
+    if (cluster == null || cluster.deleted || cluster.locked) {
+      return const <String, Offset>{};
+    }
+    final origins = <String, Offset>{
+      cluster.id: Offset(cluster.x, cluster.y),
+    };
+    if (cluster.kind == ElementKind.cluster) {
+      final els = activeElements;
+      final memberIds = computeSpatialMemberIds(
+        cluster,
+        els.where((e) => !e.deleted && !e.locked && e.isConnectibleNode),
+      );
+      for (final mid in memberIds) {
+        final member = _doc.getElement(mid);
+        if (member != null && !member.deleted && !member.locked) {
+          origins[member.id] = Offset(member.x, member.y);
+        }
       }
     }
     return origins;
@@ -1814,7 +1937,12 @@ class NotebookController extends ChangeNotifier {
       final el = _doc.getElement(id);
       if (el == null || el.deleted || el.locked) continue;
       final fields = <String, Object?>{};
-      if (el.kind == ElementKind.stickyNote) {
+      if (el.kind == ElementKind.token || el.kind == ElementKind.cluster) {
+        final sem = MindFlowColor.fromColorValue(argb);
+        fields['semanticColor'] = sem.name;
+        fields['colorValue'] = sem.borderArgb;
+        fields['fillColorValue'] = sem.fillArgb;
+      } else if (el.kind == ElementKind.stickyNote) {
         fields['fillColorValue'] = argb;
         fields['colorValue'] = argb;
       } else {
@@ -1844,12 +1972,24 @@ class NotebookController extends ChangeNotifier {
     final ops = <CrdtOp>[];
     final undoGroup = <UndoPatch>[];
     final newIds = <String>[];
+    final idMap = <String, String>{};
     var z = _doc.nextZIndex(_activePageId);
 
+    final selectedNonConnectors = <CanvasElementModel>[];
+    final selectedConnectors = <CanvasElementModel>[];
     for (final id in ids) {
       final el = _doc.getElement(id);
       if (el == null || el.deleted) continue;
+      if (el.kind == ElementKind.connector) {
+        selectedConnectors.add(el);
+      } else {
+        selectedNonConnectors.add(el);
+      }
+    }
+
+    for (final el in selectedNonConnectors) {
       final newId = _newEntityId('el');
+      idMap[el.id] = newId;
       final pair = _doc.mutateEntity(
         entityType: EntityType.element,
         entityId: newId,
@@ -1866,8 +2006,41 @@ class NotebookController extends ChangeNotifier {
           'strokeWidth': el.strokeWidth,
           'text': el.text,
           'imageUri': el.imageUri,
+          'sourceId': el.sourceId,
+          'targetId': el.targetId,
+          'semanticColor': el.semanticColor.name,
           'points': el.points.map((p) => p.toCompactJson()).toList(),
-          'zIndex': z++,
+          'zIndex': el.kind == ElementKind.cluster ? el.zIndex : z++,
+          'locked': false,
+          'authorId': _peerId,
+          'authorName': _displayName,
+          'deleted': false,
+        },
+      );
+      ops.add(pair.forward);
+      undoGroup.add(pair.undoPatch);
+      newIds.add(newId);
+    }
+
+    for (final conn in selectedConnectors) {
+      final mappedSrc = idMap[conn.sourceId] ?? '';
+      final mappedDst = idMap[conn.targetId] ?? '';
+      if (mappedSrc.isEmpty || mappedDst.isEmpty) continue;
+      final newId = _newEntityId('el');
+      final pair = _doc.mutateEntity(
+        entityType: EntityType.element,
+        entityId: newId,
+        fields: <String, Object?>{
+          'pageId': _activePageId,
+          'kind': ElementKind.connector.name,
+          'sourceId': mappedSrc,
+          'targetId': mappedDst,
+          'colorValue': conn.colorValue,
+          'fillColorValue': conn.fillColorValue,
+          'strokeWidth': conn.strokeWidth,
+          'text': conn.text,
+          'semanticColor': conn.semanticColor.name,
+          'zIndex': conn.zIndex,
           'locked': false,
           'authorId': _peerId,
           'authorName': _displayName,
@@ -1889,26 +2062,55 @@ class NotebookController extends ChangeNotifier {
     _bumpCommittedInk();
     _bumpLivePaint();
     _dispatchOps(ops);
+    _maybePushSelectionPresence();
     notifyListeners();
     return newIds;
+  }
+
+  List<UndoPatch> _collectCascadeDeleteOps(
+    Iterable<String> rootIds,
+    List<CrdtOp> opsOut, {
+    bool respectLocked = true,
+  }) {
+    final undoGroup = <UndoPatch>[];
+    final toDeleteIds = <String>{};
+    for (final id in rootIds) {
+      final el = _doc.getElement(id);
+      if (el == null || el.deleted) continue;
+      if (respectLocked && el.locked) continue;
+      toDeleteIds.add(id);
+    }
+    if (toDeleteIds.isEmpty) return undoGroup;
+
+    // Cascade-delete incident connectors so dangling edges never remain.
+    for (final el in activeElements) {
+      if (el.deleted || el.kind != ElementKind.connector) continue;
+      if (toDeleteIds.contains(el.sourceId) ||
+          toDeleteIds.contains(el.targetId)) {
+        toDeleteIds.add(el.id);
+      }
+    }
+
+    for (final id in toDeleteIds) {
+      final pair = _doc.mutateEntity(
+        entityType: EntityType.element,
+        entityId: id,
+        fields: <String, Object?>{'deleted': true},
+      );
+      opsOut.add(pair.forward);
+      undoGroup.add(pair.undoPatch);
+      if (_selectedElementId == id) _selectedElementId = null;
+      _selectedElementIds.remove(id);
+      if (_editingCardId == id) _editingCardId = null;
+    }
+    return undoGroup;
   }
 
   void deleteSelectedElements() {
     final ids = _effectiveTargetIds();
     if (ids.isEmpty) return;
     final ops = <CrdtOp>[];
-    final undoGroup = <UndoPatch>[];
-    for (final id in ids) {
-      final el = _doc.getElement(id);
-      if (el == null || el.deleted || el.locked) continue;
-      final pair = _doc.mutateEntity(
-        entityType: EntityType.element,
-        entityId: el.id,
-        fields: <String, Object?>{'deleted': true},
-      );
-      ops.add(pair.forward);
-      undoGroup.add(pair.undoPatch);
-    }
+    final undoGroup = _collectCascadeDeleteOps(ids, ops);
     if (ops.isEmpty) return;
     _pushUndoGroup(undoGroup);
     _selectedElementId = null;
@@ -1917,6 +2119,7 @@ class NotebookController extends ChangeNotifier {
     _bumpCommittedInk();
     _bumpLivePaint();
     _dispatchOps(ops);
+    _maybePushSelectionPresence();
     notifyListeners();
   }
 
@@ -1938,11 +2141,34 @@ class NotebookController extends ChangeNotifier {
     );
   }
 
+  bool _hitTestElementAt(
+    CanvasElementModel el,
+    Map<String, CanvasElementModel> byId,
+    Offset scenePos,
+    double tolerance,
+  ) {
+    if (el.kind == ElementKind.connector) {
+      final curve = computeConnectorCurve(el, byId);
+      if (curve != null) {
+        return hitTestConnectorCurve(
+          curve,
+          scenePos.dx,
+          scenePos.dy,
+          tolerance: tolerance,
+        );
+      }
+    }
+    return el.hitTest(scenePos.dx, scenePos.dy, tolerance: tolerance);
+  }
+
   void eraseAt(Offset scenePos) {
-    final candidates = activeElements.reversed;
-    for (final el in candidates) {
+    final els = activeElements;
+    final byId = <String, CanvasElementModel>{
+      for (final e in els) e.id: e,
+    };
+    for (final el in els.reversed) {
       if (el.locked) continue;
-      if (el.hitTest(scenePos.dx, scenePos.dy, tolerance: 14.0)) {
+      if (_hitTestElementAt(el, byId, scenePos, 14.0)) {
         deleteElement(el.id);
         break;
       }
@@ -1950,9 +2176,28 @@ class NotebookController extends ChangeNotifier {
   }
 
   CanvasElementModel? hitTestElement(Offset scenePos) {
-    for (final el in activeElements.reversed) {
+    final els = activeElements;
+    final byId = <String, CanvasElementModel>{
+      for (final e in els) e.id: e,
+    };
+    for (final el in els.reversed) {
       if (el.locked) continue;
-      if (el.hitTest(scenePos.dx, scenePos.dy, tolerance: 12.0)) {
+      if (_hitTestElementAt(el, byId, scenePos, 12.0)) {
+        return el;
+      }
+    }
+    return null;
+  }
+
+  CanvasElementModel? hitTestConnectibleNode(
+    Offset scenePos, {
+    String? excludeId,
+  }) {
+    for (final el in activeElements.reversed) {
+      if (el.deleted || el.locked || !el.isConnectibleNode) continue;
+      if (excludeId != null && el.id == excludeId) continue;
+      final rect = Rect.fromLTWH(el.x, el.y, el.width, el.height).inflate(8.0);
+      if (rect.contains(scenePos)) {
         return el;
       }
     }
@@ -1962,14 +2207,644 @@ class NotebookController extends ChangeNotifier {
   void deleteElement(String elementId) {
     final el = _doc.getElement(elementId);
     if (el == null || el.deleted) return;
-    if (_selectedElementId == elementId) _selectedElementId = null;
-    _selectedElementIds.remove(elementId);
-    if (_editingCardId == elementId) _editingCardId = null;
+    final ops = <CrdtOp>[];
+    final undoGroup = _collectCascadeDeleteOps(
+      <String>[elementId],
+      ops,
+      respectLocked: false,
+    );
+    if (ops.isEmpty) return;
+    _pushUndoGroup(undoGroup);
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(ops);
+    _maybePushSelectionPresence();
+    notifyListeners();
+  }
+
+  // ---------------------------------------------------------------------------
+  // MindFlow Spatial Graph, Connections, Clusters & Layout
+  // ---------------------------------------------------------------------------
+
+  String createMindFlowToken({
+    Offset? sceneCenter,
+    String initialText = '核心概念',
+    MindFlowColor? color,
+    bool beginEditing = true,
+  }) {
+    final center = sceneCenter ?? _screenCenterInScene();
+    final semantic = color ?? _activeMindFlowColor;
+    final id = _newEntityId('el');
+    const width = 176.0;
+    const height = 52.0;
+    _commitPatch(
+      EntityType.element,
+      id,
+      <String, Object?>{
+        'pageId': _activePageId,
+        'kind': ElementKind.token.name,
+        'x': center.dx - width * 0.5,
+        'y': center.dy - height * 0.5,
+        'width': width,
+        'height': height,
+        'colorValue': semantic.borderArgb,
+        'fillColorValue': semantic.fillArgb,
+        'semanticColor': semantic.name,
+        'strokeWidth': 2.0,
+        'text': initialText,
+        'zIndex': _doc.nextZIndex(_activePageId),
+        'authorId': _peerId,
+        'authorName': _displayName,
+        'deleted': false,
+      },
+    );
+    _selectedElementId = id;
+    _selectedElementIds.clear();
+    _editingCardId = beginEditing ? id : null;
+    _tool = CanvasTool.select;
+    _maybePushSelectionPresence();
+    notifyListeners();
+    return id;
+  }
+
+  String? spawnChildTokenFromSelected({MindFlowColor? color}) {
+    final parentId = _selectedElementId ??
+        (_selectedElementIds.length == 1 ? _selectedElementIds.first : null);
+    if (parentId == null) return null;
+    final parent = _doc.getElement(parentId);
+    if (parent == null ||
+        parent.deleted ||
+        parent.locked ||
+        !parent.isConnectibleNode) {
+      return null;
+    }
+
+    final els = activeElements;
+    final existingOutgoing = els
+        .where(
+          (e) =>
+              !e.deleted &&
+              e.kind == ElementKind.connector &&
+              e.sourceId == parent.id,
+        )
+        .length;
+
+    const childW = 176.0;
+    const childH = 52.0;
+    final childX = parent.x + parent.width + 84.0;
+    var childY = parent.y + existingOutgoing * 76.0;
+    for (var attempt = 0; attempt < 24; attempt++) {
+      final candidateRect = Rect.fromLTWH(childX - 8, childY - 8, childW + 16, childH + 16);
+      final overlaps = els.any((other) {
+        if (other.deleted || other.locked || !other.isConnectibleNode) {
+          return false;
+        }
+        return candidateRect.overlaps(
+          Rect.fromLTWH(other.x, other.y, other.width, other.height),
+        );
+      });
+      if (!overlaps) break;
+      childY += 76.0;
+    }
+
+    final semantic = color ??
+        (parent.semanticColor == MindFlowColor.yellow
+            ? MindFlowColor.blue
+            : _activeMindFlowColor);
+    final childId = _newEntityId('el');
+    final edgeId = _newEntityId('el');
+
+    final childPair = _doc.mutateEntity(
+      entityType: EntityType.element,
+      entityId: childId,
+      fields: <String, Object?>{
+        'pageId': _activePageId,
+        'kind': ElementKind.token.name,
+        'x': childX,
+        'y': childY,
+        'width': childW,
+        'height': childH,
+        'colorValue': semantic.borderArgb,
+        'fillColorValue': semantic.fillArgb,
+        'semanticColor': semantic.name,
+        'strokeWidth': 2.0,
+        'text': '分支思路',
+        'zIndex': _doc.nextZIndex(_activePageId),
+        'authorId': _peerId,
+        'authorName': _displayName,
+        'deleted': false,
+      },
+    );
+    final edgePair = _doc.mutateEntity(
+      entityType: EntityType.element,
+      entityId: edgeId,
+      fields: <String, Object?>{
+        'pageId': _activePageId,
+        'kind': ElementKind.connector.name,
+        'sourceId': parent.id,
+        'targetId': childId,
+        'x': parent.x + parent.width,
+        'y': parent.y + parent.height * 0.5,
+        'width': (childX - (parent.x + parent.width)).abs(),
+        'height': 0.0,
+        'colorValue': semantic.borderArgb,
+        'fillColorValue': 0,
+        'semanticColor': semantic.name,
+        'strokeWidth': 2.4,
+        'text': '',
+        'zIndex': -5,
+        'authorId': _peerId,
+        'authorName': _displayName,
+        'deleted': false,
+      },
+    );
+
+    _pushUndoGroup(<UndoPatch>[childPair.undoPatch, edgePair.undoPatch]);
+    _selectedElementId = childId;
+    _selectedElementIds.clear();
+    _editingCardId = childId;
+    _tool = CanvasTool.select;
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(<CrdtOp>[childPair.forward, edgePair.forward]);
+    _maybePushSelectionPresence();
+    notifyListeners();
+    return childId;
+  }
+
+  void startLocalConnector(Offset scenePos, {String? explicitSourceId}) {
+    final source = explicitSourceId != null
+        ? _doc.getElement(explicitSourceId)
+        : hitTestConnectibleNode(scenePos);
+    final anchor = source != null
+        ? Offset(
+            source.x + source.width,
+            source.y + source.height * 0.5,
+          )
+        : scenePos;
+    _activeConnector = ActiveConnectorPreview(
+      sourceId: source?.id,
+      startX: anchor.dx,
+      startY: anchor.dy,
+      currentX: scenePos.dx,
+      currentY: scenePos.dy,
+      colorValue: source?.semanticColor.borderArgb ?? _activeMindFlowColor.borderArgb,
+    );
+    _bumpLivePaint();
+  }
+
+  void updateLocalConnector(Offset scenePos) {
+    final preview = _activeConnector;
+    if (preview == null) return;
+    preview.currentX = scenePos.dx;
+    preview.currentY = scenePos.dy;
+    final hovered = hitTestConnectibleNode(
+      scenePos,
+      excludeId: preview.sourceId,
+    );
+    preview.hoveredTargetId = hovered?.id;
+    _bumpLivePaint();
+  }
+
+  String? finishLocalConnector(Offset scenePos) {
+    final preview = _activeConnector;
+    _activeConnector = null;
+    if (preview == null) return null;
+
+    final sourceId = preview.sourceId ??
+        hitTestConnectibleNode(Offset(preview.startX, preview.startY))?.id;
+    if (sourceId == null) {
+      _bumpLivePaint();
+      return null;
+    }
+
+    final target = hitTestConnectibleNode(scenePos, excludeId: sourceId);
+    if (target != null && target.id != sourceId) {
+      for (final existing in activeElements) {
+        if (!existing.deleted &&
+            existing.kind == ElementKind.connector &&
+            existing.sourceId == sourceId &&
+            existing.targetId == target.id) {
+          _selectedElementId = existing.id;
+          _selectedElementIds.clear();
+          _bumpLivePaint();
+          notifyListeners();
+          return existing.id;
+        }
+      }
+      final sourceEl = _doc.getElement(sourceId);
+      final sem = sourceEl?.semanticColor ?? _activeMindFlowColor;
+      final edgeId = _newEntityId('el');
+      _commitPatch(
+        EntityType.element,
+        edgeId,
+        <String, Object?>{
+          'pageId': _activePageId,
+          'kind': ElementKind.connector.name,
+          'sourceId': sourceId,
+          'targetId': target.id,
+          'x': preview.startX,
+          'y': preview.startY,
+          'width': target.x - preview.startX,
+          'height': target.y - preview.startY,
+          'colorValue': sem.borderArgb,
+          'fillColorValue': 0,
+          'semanticColor': sem.name,
+          'strokeWidth': 2.4,
+          'text': '',
+          'zIndex': -5,
+          'authorId': _peerId,
+          'authorName': _displayName,
+          'deleted': false,
+        },
+      );
+      _selectedElementId = edgeId;
+      _selectedElementIds.clear();
+      _tool = CanvasTool.select;
+      _bumpLivePaint();
+      _maybePushSelectionPresence();
+      notifyListeners();
+      return edgeId;
+    }
+
+    final dist = (scenePos - Offset(preview.startX, preview.startY)).distance;
+    if (dist < 48.0) {
+      _bumpLivePaint();
+      return null;
+    }
+
+    // Dragged onto empty space >= 48px: auto-create child token + directed connector!
+    const childW = 176.0;
+    const childH = 52.0;
+    final childId = _newEntityId('el');
+    final edgeId = _newEntityId('el');
+    final childPair = _doc.mutateEntity(
+      entityType: EntityType.element,
+      entityId: childId,
+      fields: <String, Object?>{
+        'pageId': _activePageId,
+        'kind': ElementKind.token.name,
+        'x': scenePos.dx - childW * 0.5,
+        'y': scenePos.dy - childH * 0.5,
+        'width': childW,
+        'height': childH,
+        'colorValue': _activeMindFlowColor.borderArgb,
+        'fillColorValue': _activeMindFlowColor.fillArgb,
+        'semanticColor': _activeMindFlowColor.name,
+        'strokeWidth': 2.0,
+        'text': '衍生节点',
+        'zIndex': _doc.nextZIndex(_activePageId),
+        'authorId': _peerId,
+        'authorName': _displayName,
+        'deleted': false,
+      },
+    );
+    final edgePair = _doc.mutateEntity(
+      entityType: EntityType.element,
+      entityId: edgeId,
+      fields: <String, Object?>{
+        'pageId': _activePageId,
+        'kind': ElementKind.connector.name,
+        'sourceId': sourceId,
+        'targetId': childId,
+        'x': preview.startX,
+        'y': preview.startY,
+        'width': scenePos.dx - preview.startX,
+        'height': scenePos.dy - preview.startY,
+        'colorValue': _activeMindFlowColor.borderArgb,
+        'fillColorValue': 0,
+        'semanticColor': _activeMindFlowColor.name,
+        'strokeWidth': 2.4,
+        'text': '',
+        'zIndex': -5,
+        'authorId': _peerId,
+        'authorName': _displayName,
+        'deleted': false,
+      },
+    );
+    _pushUndoGroup(<UndoPatch>[childPair.undoPatch, edgePair.undoPatch]);
+    _selectedElementId = childId;
+    _selectedElementIds.clear();
+    _editingCardId = childId;
+    _tool = CanvasTool.select;
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(<CrdtOp>[childPair.forward, edgePair.forward]);
+    _maybePushSelectionPresence();
+    notifyListeners();
+    return childId;
+  }
+
+  void cancelLocalConnector() {
+    if (_activeConnector == null) return;
+    _activeConnector = null;
+    _bumpLivePaint();
+  }
+
+  void startLocalCluster(Offset scenePos) {
+    _activeCluster = ActiveClusterPreview(
+      startX: scenePos.dx,
+      startY: scenePos.dy,
+      currentX: scenePos.dx,
+      currentY: scenePos.dy,
+      colorValue: _activeMindFlowColor.borderArgb,
+    );
+    _bumpLivePaint();
+  }
+
+  void updateLocalCluster(Offset scenePos) {
+    final preview = _activeCluster;
+    if (preview == null) return;
+    preview.currentX = scenePos.dx;
+    preview.currentY = scenePos.dy;
+    _bumpLivePaint();
+  }
+
+  String? finishLocalCluster(Offset scenePos) {
+    final preview = _activeCluster;
+    _activeCluster = null;
+    if (preview == null) return null;
+
+    var x = math.min(preview.startX, scenePos.dx);
+    var y = math.min(preview.startY, scenePos.dy);
+    var w = (scenePos.dx - preview.startX).abs();
+    var h = (scenePos.dy - preview.startY).abs();
+    if (w < 32.0 && h < 32.0) {
+      w = 340.0;
+      h = 220.0;
+      x = preview.startX - w * 0.5;
+      y = preview.startY - h * 0.5;
+    } else {
+      w = math.max(140.0, w);
+      h = math.max(100.0, h);
+    }
+
+    final sem = _activeMindFlowColor;
+    final id = _newEntityId('el');
+    _commitPatch(
+      EntityType.element,
+      id,
+      <String, Object?>{
+        'pageId': _activePageId,
+        'kind': ElementKind.cluster.name,
+        'x': x,
+        'y': y,
+        'width': w,
+        'height': h,
+        'colorValue': sem.borderArgb,
+        'fillColorValue': sem.fillArgb,
+        'semanticColor': sem.name,
+        'strokeWidth': 1.8,
+        'text': '主题分组',
+        'zIndex': -10,
+        'authorId': _peerId,
+        'authorName': _displayName,
+        'deleted': false,
+      },
+    );
+    _selectedElementId = id;
+    _selectedElementIds.clear();
+    _tool = CanvasTool.select;
+    _bumpLivePaint();
+    _maybePushSelectionPresence();
+    notifyListeners();
+    return id;
+  }
+
+  void cancelLocalCluster() {
+    if (_activeCluster == null) return;
+    _activeCluster = null;
+    _bumpLivePaint();
+  }
+
+  String? groupSelectionIntoCluster({
+    String title = '主题分组',
+    MindFlowColor? color,
+  }) {
+    final ids = _effectiveTargetIds();
+    if (ids.isEmpty) return null;
+    double? minX;
+    double? minY;
+    double? maxX;
+    double? maxY;
+
+    for (final id in ids) {
+      final el = _doc.getElement(id);
+      if (el == null ||
+          el.deleted ||
+          el.locked ||
+          el.kind == ElementKind.connector ||
+          el.kind == ElementKind.cluster) {
+        continue;
+      }
+      final b = el.bounds;
+      minX = minX == null ? b.left : math.min(minX, b.left);
+      minY = minY == null ? b.top : math.min(minY, b.top);
+      maxX = maxX == null ? b.right : math.max(maxX, b.right);
+      maxY = maxY == null ? b.bottom : math.max(maxY, b.bottom);
+    }
+    if (minX == null || minY == null || maxX == null || maxY == null) {
+      return null;
+    }
+
+    final sem = color ?? _activeMindFlowColor;
+    final clusterId = _newEntityId('el');
+    final x = minX - 32.0;
+    final y = minY - 52.0;
+    final w = math.max(220.0, (maxX - minX) + 64.0);
+    final h = math.max(130.0, (maxY - minY) + 84.0);
+
+    _commitPatch(
+      EntityType.element,
+      clusterId,
+      <String, Object?>{
+        'pageId': _activePageId,
+        'kind': ElementKind.cluster.name,
+        'x': x,
+        'y': y,
+        'width': w,
+        'height': h,
+        'colorValue': sem.borderArgb,
+        'fillColorValue': sem.fillArgb,
+        'semanticColor': sem.name,
+        'strokeWidth': 1.8,
+        'text': title,
+        'zIndex': -10,
+        'authorId': _peerId,
+        'authorName': _displayName,
+        'deleted': false,
+      },
+    );
+    _selectedElementId = clusterId;
+    _selectedElementIds.clear();
+    _tool = CanvasTool.select;
+    _bumpLivePaint();
+    _maybePushSelectionPresence();
+    notifyListeners();
+    return clusterId;
+  }
+
+  void updateElementSemanticColor(String elementId, MindFlowColor color) {
+    final el = _doc.getElement(elementId);
+    if (el == null || el.deleted || el.locked) return;
+    _activeMindFlowColor = color;
     _commitPatch(
       EntityType.element,
       elementId,
-      <String, Object?>{'deleted': true},
+      <String, Object?>{
+        'semanticColor': color.name,
+        'colorValue': color.borderArgb,
+        'fillColorValue': color.fillArgb,
+      },
     );
+  }
+
+  void recolorSelectionSemantic(MindFlowColor color) {
+    _activeMindFlowColor = color;
+    final ids = _effectiveTargetIds();
+    if (ids.isEmpty) {
+      notifyListeners();
+      return;
+    }
+    final ops = <CrdtOp>[];
+    final undoGroup = <UndoPatch>[];
+    for (final id in ids) {
+      final el = _doc.getElement(id);
+      if (el == null || el.deleted || el.locked) continue;
+      final fields = <String, Object?>{
+        'semanticColor': color.name,
+        'colorValue': color.borderArgb,
+      };
+      if (el.kind != ElementKind.stroke &&
+          el.kind != ElementKind.highlighter &&
+          el.kind != ElementKind.connector) {
+        fields['fillColorValue'] = color.fillArgb;
+      }
+      final pair = _doc.mutateEntity(
+        entityType: EntityType.element,
+        entityId: el.id,
+        fields: fields,
+      );
+      ops.add(pair.forward);
+      undoGroup.add(pair.undoPatch);
+    }
+    if (ops.isEmpty) return;
+    _pushUndoGroup(undoGroup);
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(ops);
+    notifyListeners();
+  }
+
+  int autoLayoutActivePageMindFlow() {
+    final els = activeElements;
+    final hasLockedPdf = els.any(
+      (e) => !e.deleted && e.locked && e.zIndex <= -50,
+    );
+    final connectors = els
+        .where((e) => !e.deleted && e.kind == ElementKind.connector)
+        .toList();
+    final connectedNodeIds = <String>{
+      for (final c in connectors) c.sourceId,
+      for (final c in connectors) c.targetId,
+    };
+    final nodes = els
+        .where(
+          (e) =>
+              !e.deleted &&
+              !e.locked &&
+              (e.kind == ElementKind.token ||
+                  (e.isConnectibleNode && connectedNodeIds.contains(e.id))),
+        )
+        .toList();
+    if (nodes.isEmpty) return 0;
+
+    final startX = hasLockedPdf ? 920.0 : 120.0;
+    final startY = hasLockedPdf ? 80.0 : 100.0;
+    final positions = computeMindFlowAutoLayout(
+      nodes,
+      connectors,
+      startX: startX,
+      startY: startY,
+      colGap: 256.0,
+      rowGap: 88.0,
+    );
+
+    final ops = <CrdtOp>[];
+    final undoGroup = <UndoPatch>[];
+    for (final node in nodes) {
+      final pos = positions[node.id];
+      if (pos == null) continue;
+      if ((node.x - pos.x).abs() < 0.5 && (node.y - pos.y).abs() < 0.5) {
+        continue;
+      }
+      final pair = _doc.mutateEntity(
+        entityType: EntityType.element,
+        entityId: node.id,
+        fields: <String, Object?>{
+          'x': pos.x,
+          'y': pos.y,
+        },
+      );
+      ops.add(pair.forward);
+      undoGroup.add(pair.undoPatch);
+    }
+    if (ops.isEmpty) return 0;
+    _pushUndoGroup(undoGroup);
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(ops);
+    notifyListeners();
+    return ops.length;
+  }
+
+  void alignSelectedElements({required bool horizontal}) {
+    final ids = _effectiveTargetIds();
+    if (ids.length < 2) return;
+    final items = <CanvasElementModel>[];
+    for (final id in ids) {
+      final el = _doc.getElement(id);
+      if (el == null ||
+          el.deleted ||
+          el.locked ||
+          el.kind == ElementKind.connector) {
+        continue;
+      }
+      items.add(el);
+    }
+    if (items.length < 2) return;
+
+    items.sort((a, b) => horizontal ? a.x.compareTo(b.x) : a.y.compareTo(b.y));
+    final anchorX = items.first.x;
+    final anchorY = items.first.y;
+    var cursor = horizontal ? anchorX : anchorY;
+
+    final ops = <CrdtOp>[];
+    final undoGroup = <UndoPatch>[];
+    for (final item in items) {
+      final targetX = horizontal ? cursor : anchorX;
+      final targetY = horizontal ? anchorY : cursor;
+      cursor += (horizontal ? item.width + 28.0 : item.height + 20.0);
+      if ((item.x - targetX).abs() < 0.5 && (item.y - targetY).abs() < 0.5) {
+        continue;
+      }
+      final pair = _doc.mutateEntity(
+        entityType: EntityType.element,
+        entityId: item.id,
+        fields: <String, Object?>{
+          'x': targetX,
+          'y': targetY,
+        },
+      );
+      ops.add(pair.forward);
+      undoGroup.add(pair.undoPatch);
+    }
+    if (ops.isEmpty) return;
+    _pushUndoGroup(undoGroup);
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(ops);
+    notifyListeners();
   }
 
   void clearActivePage() {
@@ -2574,96 +3449,111 @@ class NotebookController extends ChangeNotifier {
   }
 
   // ---------------------------------------------------------------------------
-  // Multi-Page PDF Import & High-Res PNG / Markdown Note Export
+  // Continuous Single-Page PDF Import & High-Res PNG / Markdown Note Export
   // ---------------------------------------------------------------------------
 
-  /// Imports rendered PDF pages either into the current notebook or into a
-  /// freshly created dedicated notebook. Each PDF page becomes a clean notebook
-  /// page with a locked background sheet (`zIndex: -100`, `locked: true`) so
-  /// users and collaborators can handwrite & highlight freely on top.
+  /// Imports all rendered pages of [pdf] vertically onto ONE single canvas page
+  /// in continuous reading order (`zIndex: -1000 + i`, `locked: true`), so users
+  /// and collaborators can scroll and handwrite/highlight seamlessly across the
+  /// entire document without accidental erases or drags.
   Future<int> importPdfDocument(
     PdfImportedDocument pdf, {
+    PdfImportPlacement placement = PdfImportPlacement.newSinglePage,
     bool asNewNotebook = false,
   }) async {
     if (pdf.pages.isEmpty) return 0;
 
+    final effectivePlacement =
+        asNewNotebook ? PdfImportPlacement.newNotebookSinglePage : placement;
+
     final rawName = pdf.fileName.trim();
     final dotIdx = rawName.lastIndexOf('.');
-    final baseTitle = (dotIdx > 0 ? rawName.substring(0, dotIdx) : rawName)
-        .trim();
+    final baseTitle =
+        (dotIdx > 0 ? rawName.substring(0, dotIdx) : rawName).trim();
     final cleanTitle = baseTitle.isEmpty ? 'PDF 讲义' : baseTitle;
 
     final ops = <CrdtOp>[];
     final undoGroup = <UndoPatch>[];
     var targetNotebookId = _activeNotebookId;
+    String targetPageId;
 
-    if (asNewNotebook) {
-      targetNotebookId = _newEntityId('nb');
-      final nbPair = _doc.mutateEntity(
-        entityType: EntityType.notebook,
-        entityId: targetNotebookId,
-        fields: <String, Object?>{
-          'title': cleanTitle,
-          'colorValue': 0xFF4F46E5,
-          'sortOrder': notebooks.length,
-          'deleted': false,
-        },
-      );
-      ops.add(nbPair.forward);
-      undoGroup.add(nbPair.undoPatch);
-    }
-
-    final existingPages = _doc.pagesForNotebook(targetNotebookId);
-    final baseSort = existingPages.length;
     const sheetWidth = 794.0;
     const sheetX = 40.0;
-    const sheetY = 32.0;
+    const sheetGap = 28.0;
+    var startY = 32.0;
 
-    String? firstImportedPageId;
+    if (effectivePlacement == PdfImportPlacement.currentPage) {
+      targetPageId = _activePageId;
+      final existing = _doc.elementsForPage(targetPageId).where((e) => !e.deleted);
+      if (existing.isNotEmpty) {
+        var maxBottom = 0.0;
+        for (final el in existing) {
+          final b = el.bounds.bottom;
+          if (b > maxBottom) maxBottom = b;
+        }
+        startY = maxBottom + 48.0;
+      }
+    } else {
+      if (effectivePlacement == PdfImportPlacement.newNotebookSinglePage) {
+        targetNotebookId = _newEntityId('nb');
+        final nbPair = _doc.mutateEntity(
+          entityType: EntityType.notebook,
+          entityId: targetNotebookId,
+          fields: <String, Object?>{
+            'title': cleanTitle,
+            'colorValue': 0xFF4F46E5,
+            'sortOrder': notebooks.length,
+            'deleted': false,
+          },
+        );
+        ops.add(nbPair.forward);
+        undoGroup.add(nbPair.undoPatch);
+      }
 
-    for (var i = 0; i < pdf.pages.length; i++) {
-      final p = pdf.pages[i];
-      final pageId = _newEntityId('page');
-      firstImportedPageId ??= pageId;
-
-      final aspect = (p.width > 0 && p.height > 0)
-          ? (p.height / p.width)
-          : (842.0 / 595.0);
-      final sheetHeight = (sheetWidth * aspect).clamp(320.0, 2400.0);
-
+      final existingPages = _doc.pagesForNotebook(targetNotebookId);
+      targetPageId = _newEntityId('page');
       final pagePair = _doc.mutateEntity(
         entityType: EntityType.page,
-        entityId: pageId,
+        entityId: targetPageId,
         fields: <String, Object?>{
           'notebookId': targetNotebookId,
-          'title': '$cleanTitle · P${p.pageNumber}',
+          'title': cleanTitle,
           'background': PageBackground.blank.name,
-          'backgroundColorValue': 0xFFF8FAFC,
-          'sortOrder': baseSort + i,
+          'backgroundColorValue': 0xFFF1F5F9,
+          'sortOrder': existingPages.length,
           'bookmarked': false,
           'deleted': false,
         },
       );
       ops.add(pagePair.forward);
       undoGroup.add(pagePair.undoPatch);
+    }
+
+    var currentY = startY;
+    for (var i = 0; i < pdf.pages.length; i++) {
+      final p = pdf.pages[i];
+      final aspect = (p.width > 0 && p.height > 0)
+          ? (p.height / p.width)
+          : (842.0 / 595.0);
+      final sheetHeight = (sheetWidth * aspect).clamp(240.0, 2400.0);
 
       final elId = _newEntityId('el');
       final elPair = _doc.mutateEntity(
         entityType: EntityType.element,
         entityId: elId,
         fields: <String, Object?>{
-          'pageId': pageId,
+          'pageId': targetPageId,
           'kind': ElementKind.image.name,
           'x': sheetX,
-          'y': sheetY,
+          'y': currentY,
           'width': sheetWidth,
           'height': sheetHeight,
           'colorValue': 0xFF0F172A,
           'fillColorValue': 0xFFFFFFFF,
           'strokeWidth': 1.0,
-          'text': '',
+          'text': '$cleanTitle · P${p.pageNumber}',
           'imageUri': p.dataUrl,
-          'zIndex': -100,
+          'zIndex': -1000 + i,
           'locked': true,
           'authorId': _peerId,
           'authorName': _displayName,
@@ -2672,21 +3562,24 @@ class NotebookController extends ChangeNotifier {
       );
       ops.add(elPair.forward);
       undoGroup.add(elPair.undoPatch);
+      currentY += sheetHeight + sheetGap;
     }
 
     _pushUndoGroup(undoGroup);
-    if (firstImportedPageId != null) {
-      _activeNotebookId = targetNotebookId;
-      _activePageId = firstImportedPageId;
-      _selectedElementId = null;
-      _selectedElementIds.clear();
-      _editingCardId = null;
-      _panOffset = const Offset(24, 18);
-      if (_viewportSize.height > 200) {
-        final fitZoom = ((_viewportSize.height - 80) / 1180.0).clamp(0.55, 1.0);
-        _zoom = fitZoom;
-      }
-    }
+    _activeNotebookId = targetNotebookId;
+    _activePageId = targetPageId;
+    _selectedElementId = null;
+    _selectedElementIds.clear();
+    _editingCardId = null;
+
+    final viewW = _viewportSize.width > 120 ? _viewportSize.width : 1024.0;
+    final fitZoom = ((viewW - 64.0) / 860.0).clamp(0.42, 1.0);
+    _zoom = fitZoom;
+    final centeredPanX = math.max(
+      12.0,
+      (viewW - sheetWidth * fitZoom) * 0.5 - sheetX * fitZoom,
+    );
+    _panOffset = Offset(centeredPanX, 20.0 - startY * fitZoom);
 
     _bumpCommittedInk();
     _bumpLivePaint();
@@ -2722,6 +3615,7 @@ class NotebookController extends ChangeNotifier {
 
       var strokeCount = 0;
       var hlCount = 0;
+      var pdfSheetCount = 0;
       var wroteTextBlock = false;
 
       for (final el in els) {
@@ -2753,10 +3647,36 @@ class NotebookController extends ChangeNotifier {
             }
             break;
           case ElementKind.image:
-            final imgTitle = el.text.trim().isNotEmpty
-                ? el.text.trim()
-                : (el.locked ? 'PDF 讲义页底图' : '插图卡片');
-            buf.writeln('- 🖼️ **$imgTitle**');
+            if (el.locked && el.zIndex <= -50) {
+              pdfSheetCount += 1;
+            } else {
+              final imgTitle =
+                  el.text.trim().isNotEmpty ? el.text.trim() : '插图卡片';
+              buf.writeln('- 🖼️ **$imgTitle**');
+              wroteTextBlock = true;
+            }
+            break;
+          case ElementKind.token:
+            if (el.text.trim().isNotEmpty) {
+              buf.writeln(
+                '- 💡 **[${el.semanticColor.label}] ${el.text.trim().replaceAll('\n', ' ')}**',
+              );
+              wroteTextBlock = true;
+            }
+            break;
+          case ElementKind.connector:
+            final label =
+                el.text.trim().isNotEmpty ? '（${el.text.trim()}）' : '';
+            buf.writeln(
+              '- 🔀 **关联连线$label**：`${el.sourceId}` → `${el.targetId}`',
+            );
+            wroteTextBlock = true;
+            break;
+          case ElementKind.cluster:
+            final cTitle =
+                el.text.trim().isNotEmpty ? el.text.trim() : '主题分组';
+            buf.writeln('### 🧩 分组：$cTitle');
+            buf.writeln();
             wroteTextBlock = true;
             break;
           case ElementKind.stroke:
@@ -2766,6 +3686,11 @@ class NotebookController extends ChangeNotifier {
             hlCount += 1;
             break;
         }
+      }
+
+      if (pdfSheetCount > 0) {
+        buf.writeln('- 📄 **PDF 讲义连续底图**：共 $pdfSheetCount 页');
+        wroteTextBlock = true;
       }
 
       if (strokeCount > 0 || hlCount > 0) {
@@ -2802,7 +3727,7 @@ class NotebookController extends ChangeNotifier {
       sceneRect = sceneRect.expandToInclude(r.inflate(28.0));
     }
     final clampedW = sceneRect.width.clamp(640.0, 2400.0);
-    final clampedH = sceneRect.height.clamp(480.0, 3400.0);
+    final clampedH = sceneRect.height.clamp(480.0, 36000.0);
     final exportScene = Rect.fromLTWH(
       sceneRect.left,
       sceneRect.top,
@@ -2812,7 +3737,7 @@ class NotebookController extends ChangeNotifier {
 
     final effectiveScale = math.min(
       pixelRatio.clamp(1.0, 3.0),
-      math.min(3600.0 / exportScene.width, 4800.0 / exportScene.height),
+      math.min(4096.0 / exportScene.width, 12288.0 / exportScene.height),
     );
     final outW = math.max(1, (exportScene.width * effectiveScale).round());
     final outH = math.max(1, (exportScene.height * effectiveScale).round());
@@ -2853,78 +3778,32 @@ class NotebookController extends ChangeNotifier {
         paintInk: false,
       ).paint(canvas, outSize);
 
-      // 2. Cards (PDF sheets, images, sticky notes, Markdown cards) below ink
+      // 2. Locked PDF sheets below MindFlow graph layer
       canvas.save();
       canvas.translate(exportPan.dx, exportPan.dy);
       canvas.scale(effectiveScale, effectiveScale);
       for (final el in els) {
-        if (el.deleted) continue;
-        if (el.kind != ElementKind.image &&
-            el.kind != ElementKind.stickyNote &&
-            el.kind != ElementKind.textCard) {
-          continue;
-        }
-        final cardRect = Rect.fromLTWH(el.x, el.y, el.width, el.height);
+        if (el.deleted || el.kind != ElementKind.image) continue;
         final isFullBleedPdf =
-            el.kind == ElementKind.image && el.locked && el.text.trim().isEmpty;
-        final radius = Radius.circular(
-          isFullBleedPdf ? 2 : (el.kind == ElementKind.stickyNote ? 6 : 12),
-        );
-        final rrect = RRect.fromRectAndRadius(cardRect, radius);
-        final bg = el.fillColorValue != 0
-            ? Color(el.fillColorValue)
-            : (el.kind == ElementKind.stickyNote
-                ? const Color(0xFFFEF08A)
-                : Colors.white);
-        canvas.drawRRect(rrect, Paint()..color = bg);
-
-        if (el.kind == ElementKind.image) {
-          final img = decodedImages[el.id];
-          if (img != null) {
-            final imgRect =
-                isFullBleedPdf ? cardRect : cardRect.deflate(6.0);
-            paintImage(
-              canvas: canvas,
-              rect: imgRect,
-              image: img,
-              fit: BoxFit.contain,
-              filterQuality: FilterQuality.medium,
-            );
-          }
-        } else if (el.text.trim().isNotEmpty) {
-          final clean = el.text
-              .replaceAll(RegExp(r'^#{1,3}\s+', multiLine: true), '')
-              .replaceAll('**', '');
-          final tp = TextPainter(
-            text: TextSpan(
-              text: clean,
-              style: const TextStyle(
-                color: Color(0xFF0F172A),
-                fontSize: 13.5,
-                height: 1.45,
-              ),
-            ),
-            textDirection: TextDirection.ltr,
-          )..layout(maxWidth: math.max(40.0, el.width - 28.0));
-          canvas.save();
-          canvas.clipRRect(rrect);
-          tp.paint(canvas, Offset(el.x + 14.0, el.y + 14.0));
-          canvas.restore();
-        }
-
-        if (!isFullBleedPdf) {
-          canvas.drawRRect(
-            rrect,
-            Paint()
-              ..color = const Color(0xFFCBD5E1)
-              ..style = PaintingStyle.stroke
-              ..strokeWidth = 1.0,
+            el.locked && (el.zIndex <= -50 || el.text.trim().isEmpty);
+        if (!isFullBleedPdf) continue;
+        final cardRect = Rect.fromLTWH(el.x, el.y, el.width, el.height);
+        final rrect = RRect.fromRectAndRadius(cardRect, const Radius.circular(2));
+        canvas.drawRRect(rrect, Paint()..color = Colors.white);
+        final img = decodedImages[el.id];
+        if (img != null) {
+          paintImage(
+            canvas: canvas,
+            rect: cardRect,
+            image: img,
+            fit: BoxFit.contain,
+            filterQuality: FilterQuality.medium,
           );
         }
       }
       canvas.restore();
 
-      // 3. Vector strokes, highlighters & shapes on top
+      // 3. MindFlow clusters & causal Bezier connectors
       CommittedCanvasPainter(
         page: page,
         elements: els,
@@ -2933,6 +3812,105 @@ class NotebookController extends ChangeNotifier {
         selectedElementId: null,
         showPageGuide: false,
         paintPaper: false,
+        paintGraph: true,
+        paintInk: false,
+      ).paint(canvas, outSize);
+
+      // 4. Foreground cards (images, sticky notes, Markdown cards, MindFlow tokens)
+      canvas.save();
+      canvas.translate(exportPan.dx, exportPan.dy);
+      canvas.scale(effectiveScale, effectiveScale);
+      for (final el in els) {
+        if (el.deleted) continue;
+        if (el.kind != ElementKind.image &&
+            el.kind != ElementKind.stickyNote &&
+            el.kind != ElementKind.textCard &&
+            el.kind != ElementKind.token) {
+          continue;
+        }
+        final isFullBleedPdf = el.kind == ElementKind.image &&
+            el.locked &&
+            (el.zIndex <= -50 || el.text.trim().isEmpty);
+        if (isFullBleedPdf) continue;
+
+        final cardRect = Rect.fromLTWH(el.x, el.y, el.width, el.height);
+        final isToken = el.kind == ElementKind.token;
+        final radius = Radius.circular(
+          el.kind == ElementKind.stickyNote ? 6 : 12,
+        );
+        final rrect = RRect.fromRectAndRadius(cardRect, radius);
+        final bg = isToken
+            ? Color(el.semanticColor.fillArgb)
+            : (el.fillColorValue != 0
+                ? Color(el.fillColorValue)
+                : (el.kind == ElementKind.stickyNote
+                    ? const Color(0xFFFEF08A)
+                    : Colors.white));
+        canvas.drawRRect(rrect, Paint()..color = bg);
+
+        if (el.kind == ElementKind.image) {
+          final img = decodedImages[el.id];
+          if (img != null) {
+            paintImage(
+              canvas: canvas,
+              rect: cardRect.deflate(6.0),
+              image: img,
+              fit: BoxFit.contain,
+              filterQuality: FilterQuality.medium,
+            );
+          }
+        } else if (el.text.trim().isNotEmpty) {
+          final clean = isToken
+              ? el.text.trim()
+              : el.text
+                  .replaceAll(RegExp(r'^#{1,3}\s+', multiLine: true), '')
+                  .replaceAll('**', '');
+          final textColor = isToken
+              ? Color(el.semanticColor.textArgb)
+              : const Color(0xFF0F172A);
+          final tp = TextPainter(
+            text: TextSpan(
+              text: clean,
+              style: TextStyle(
+                color: textColor,
+                fontSize: isToken ? 13.5 : 13.5,
+                fontWeight: isToken ? FontWeight.w600 : FontWeight.normal,
+                height: 1.4,
+              ),
+            ),
+            textDirection: TextDirection.ltr,
+          )..layout(maxWidth: math.max(40.0, el.width - (isToken ? 24.0 : 28.0)));
+          canvas.save();
+          canvas.clipRRect(rrect);
+          tp.paint(
+            canvas,
+            Offset(el.x + (isToken ? 12.0 : 14.0), el.y + (isToken ? 10.0 : 14.0)),
+          );
+          canvas.restore();
+        }
+
+        canvas.drawRRect(
+          rrect,
+          Paint()
+            ..color = isToken
+                ? Color(el.semanticColor.borderArgb)
+                : const Color(0xFFCBD5E1)
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = isToken ? 1.8 : 1.0,
+        );
+      }
+      canvas.restore();
+
+      // 5. Vector strokes, highlighters & shapes on top
+      CommittedCanvasPainter(
+        page: page,
+        elements: els,
+        panOffset: exportPan,
+        zoom: effectiveScale,
+        selectedElementId: null,
+        showPageGuide: false,
+        paintPaper: false,
+        paintGraph: false,
         paintInk: true,
       ).paint(canvas, outSize);
 
@@ -2984,6 +3962,193 @@ class NotebookController extends ChangeNotifier {
         jsonEncode(<String, dynamic>{'snapshot': snapshot}),
       );
       return changed || true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // MindFlow Canonical JSON / Context / AI Skill / SVG & MCP Integration
+  // ---------------------------------------------------------------------------
+
+  String get serverHttpBaseUrl {
+    if (_lanHttpUrls.isNotEmpty) {
+      final parsed = Uri.tryParse(_lanHttpUrls.first);
+      if (parsed != null && parsed.hasScheme && parsed.host.isNotEmpty) {
+        return '${parsed.scheme}://${parsed.host}:${parsed.hasPort ? parsed.port : (parsed.scheme == 'https' ? 443 : 8787)}';
+      }
+    }
+    final wsUri = Uri.tryParse(_wsUrl);
+    if (wsUri != null && wsUri.host.isNotEmpty) {
+      final scheme = wsUri.scheme == 'wss' ? 'https' : 'http';
+      final port = wsUri.hasPort
+          ? wsUri.port
+          : (_hostedServerPort ?? (scheme == 'https' ? 443 : 8787));
+      return '$scheme://${wsUri.host}:$port';
+    }
+    return 'http://127.0.0.1:${_hostedServerPort ?? 8787}';
+  }
+
+  String get mindflowMcpEndpointUrl =>
+      '$serverHttpBaseUrl/api/rooms/${Uri.encodeComponent(_roomId)}/mindflow/mcp'
+      '?readOnly=${_mindflowMcpReadOnly ? '1' : '0'}';
+
+  String exportActivePageMindFlowBoardJson() {
+    final map = exportPageAsMindFlowBoard(
+      _doc,
+      _activePageId,
+      revision: _localMindFlowRevision,
+      selectedIds: _effectiveTargetIds(),
+      viewportX: _panOffset.dx,
+      viewportY: _panOffset.dy,
+      scale: _zoom,
+    );
+    return const JsonEncoder.withIndent('  ').convert(map);
+  }
+
+  String exportActivePageMindFlowContextJson({String scope = 'selected'}) {
+    final map = exportPageAsMindFlowContext(
+      _doc,
+      _activePageId,
+      revision: _localMindFlowRevision,
+      scope: scope,
+      selectedIds: _effectiveTargetIds(),
+    );
+    return const JsonEncoder.withIndent('  ').convert(map);
+  }
+
+  String buildActivePageAiSkillBundle({String scope = 'selected'}) {
+    return buildMindFlowAiSkillBundle(
+      _doc,
+      _activePageId,
+      revision: _localMindFlowRevision,
+      scope: scope,
+      selectedIds: _effectiveTargetIds(),
+    );
+  }
+
+  String exportActivePageMindFlowSvg() {
+    return exportPageAsMindFlowSvg(_doc, _activePageId);
+  }
+
+  Future<String?> saveActivePageMindFlowJson() {
+    final raw = (activePage?.title ?? 'mindflow-board').trim();
+    final safe = raw.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    final filename = '${safe.isEmpty ? 'mindflow-board' : safe}.mindflow.json';
+    return _platform.saveExportFile(
+      filename,
+      exportActivePageMindFlowBoardJson(),
+    );
+  }
+
+  Future<String?> saveActivePageSvg() {
+    final raw = (activePage?.title ?? 'mindflow-board').trim();
+    final safe = raw.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    final filename = '${safe.isEmpty ? 'mindflow-board' : safe}.mindflow.svg';
+    return _platform.saveExportFile(filename, exportActivePageMindFlowSvg());
+  }
+
+  String _stripJsonCodeFences(String raw) {
+    final trimmed = raw.trim();
+    final match = RegExp(
+      r'^```(?:json)?\s*([\s\S]*?)\s*```$',
+      caseSensitive: false,
+    ).firstMatch(trimmed);
+    return match != null ? match.group(1)!.trim() : trimmed;
+  }
+
+  int importMindFlowJsonString(String rawJson, {bool intoNewPage = false}) {
+    final cleaned = _stripJsonCodeFences(rawJson);
+    final decoded = jsonDecode(cleaned);
+    if (decoded is! Map) {
+      throw const FormatException('请提供有效的 MindFlow JSON 对象');
+    }
+    final map = Map<String, dynamic>.from(decoded);
+    final suggestedTitle = (map['title'] as String? ?? '').trim();
+
+    if (intoNewPage) {
+      createPage(
+        title: suggestedTitle.isNotEmpty ? suggestedTitle : 'MindFlow 导图页',
+        background: PageBackground.dots,
+      );
+    }
+
+    final els = activeElements;
+    final hasLockedPdf = els.any(
+      (e) => !e.deleted && e.locked && e.zIndex <= -50,
+    );
+    final res = importMindFlowJsonToPage(
+      _doc,
+      map,
+      pageId: _activePageId,
+      offsetX: hasLockedPdf ? 920.0 : 0.0,
+      authorId: _peerId,
+      authorName: _displayName,
+    );
+    if (res.ops.isEmpty) return 0;
+    _pushUndoGroup(res.undoPatches);
+    _selectedElementIds
+      ..clear()
+      ..addAll(res.touchedIds);
+    _selectedElementId =
+        res.touchedIds.length == 1 ? res.touchedIds.first : null;
+    _editingCardId = null;
+    _tool = CanvasTool.select;
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(res.ops);
+    _maybePushSelectionPresence();
+    notifyListeners();
+    return res.touchedIds.length;
+  }
+
+  Future<List<Map<String, dynamic>>> fetchMindFlowBackups() async {
+    try {
+      final uri = Uri.parse(
+        '$serverHttpBaseUrl/api/rooms/${Uri.encodeComponent(_roomId)}/mindflow/backups',
+      );
+      final resp = await _platform.httpGet(uri);
+      if (resp == null || resp.statusCode != 200) {
+        return const <Map<String, dynamic>>[];
+      }
+      final decoded = jsonDecode(resp.body) as Map<String, dynamic>;
+      final list = decoded['backups'] as List<dynamic>? ?? const <dynamic>[];
+      return list
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+    } catch (_) {
+      return const <Map<String, dynamic>>[];
+    }
+  }
+
+  Future<bool> restoreMindFlowBackup(int revision) async {
+    try {
+      final uri = Uri.parse(
+        '$serverHttpBaseUrl/api/rooms/${Uri.encodeComponent(_roomId)}/mindflow/restore',
+      );
+      final resp = await _platform.httpPostJson(
+        uri,
+        jsonEncode(<String, dynamic>{'revision': revision}),
+      );
+      if (resp == null || resp.statusCode != 200) return false;
+      final decoded = jsonDecode(resp.body) as Map<String, dynamic>;
+      if (decoded['ok'] != true) return false;
+      if (_connectionState != SyncConnectionState.connected &&
+          decoded['board'] is Map) {
+        importMindFlowJsonToPage(
+          _doc,
+          Map<String, dynamic>.from(decoded['board'] as Map),
+          pageId: _activePageId,
+          authorId: 'mindflow-restore',
+          authorName: '版本恢复',
+        );
+        _bumpCommittedInk();
+        _bumpLivePaint();
+        _scheduleSave();
+        notifyListeners();
+      }
+      return true;
     } catch (_) {
       return false;
     }
@@ -3423,6 +4588,7 @@ class NotebookController extends ChangeNotifier {
       cursorY: cursorY,
       cursorVisible: cursorVisible,
       lastSeenMs: DateTime.now().millisecondsSinceEpoch,
+      selectedElementIds: _effectiveTargetIds().toList(),
     );
   }
 
@@ -3517,6 +4683,10 @@ class NotebookController extends ChangeNotifier {
         if (savedGuide != null) {
           _showPageGuide = savedGuide;
         }
+        final savedMcpRo = meta['mindflowMcpReadOnly'] as bool?;
+        if (savedMcpRo != null) {
+          _mindflowMcpReadOnly = savedMcpRo;
+        }
         final savedDock = meta['toolbarDock'] as String?;
         if (savedDock != null && savedDock.isNotEmpty) {
           _toolbarDock = ToolbarDock.values.firstWhere(
@@ -3598,6 +4768,7 @@ class NotebookController extends ChangeNotifier {
         'wsUrl': _wsUrl,
         'roomId': _roomId,
         'showPageGuide': _showPageGuide,
+        'mindflowMcpReadOnly': _mindflowMcpReadOnly,
         'toolbarDock': _toolbarDock.name,
         'toolbarFloatingVertical': _toolbarFloatingVertical,
         'toolbarCollapsed': _toolbarCollapsed,

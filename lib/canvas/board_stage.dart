@@ -17,6 +17,8 @@ enum _GestureMode {
   pinchZoom,
   drawStroke,
   drawShape,
+  drawConnector,
+  drawCluster,
   lasso,
   dragLassoGroup,
   erase,
@@ -30,11 +32,13 @@ class BoardStage extends StatefulWidget {
     required this.controller,
     this.isSpacePanPressed = false,
     this.onRequestInsertImageAt,
+    this.onRequestEditGraphLabel,
   });
 
   final NotebookController controller;
   final bool isSpacePanPressed;
   final void Function(Offset scenePos)? onRequestInsertImageAt;
+  final void Function(CanvasElementModel element)? onRequestEditGraphLabel;
 
   @override
   State<BoardStage> createState() => _BoardStageState();
@@ -91,6 +95,10 @@ class _BoardStageState extends State<BoardStage> {
   // Hold-to-Snap straight line timer (380ms pause at end of freehand stroke)
   Timer? _holdSnapTimer;
   Offset? _holdAnchorLocalPos;
+
+  // Double-tap tracking for instant MindFlow token creation & graph label editing
+  int _lastSurfaceTapMs = 0;
+  Offset _lastSurfaceTapScene = Offset.zero;
 
   @override
   void dispose() {
@@ -191,6 +199,8 @@ class _BoardStageState extends State<BoardStage> {
             widget.controller.cancelLocalStroke();
           }
           widget.controller.cancelLocalShape();
+          widget.controller.cancelLocalConnector();
+          widget.controller.cancelLocalCluster();
           widget.controller.cancelLasso();
           _mode = _GestureMode.pinchZoom;
           _activePointerId = null;
@@ -291,6 +301,10 @@ class _BoardStageState extends State<BoardStage> {
         }
       } else if (_mode == _GestureMode.drawShape) {
         c.cancelLocalShape();
+      } else if (_mode == _GestureMode.drawConnector) {
+        c.cancelLocalConnector();
+      } else if (_mode == _GestureMode.drawCluster) {
+        c.cancelLocalCluster();
       } else if (_mode == _GestureMode.lasso) {
         c.cancelLasso();
       }
@@ -364,6 +378,23 @@ class _BoardStageState extends State<BoardStage> {
       return;
     }
 
+    if (c.tool == CanvasTool.token) {
+      c.createMindFlowToken(sceneCenter: scenePos);
+      return;
+    }
+
+    if (c.tool == CanvasTool.connector) {
+      _mode = _GestureMode.drawConnector;
+      c.startLocalConnector(scenePos);
+      return;
+    }
+
+    if (c.tool == CanvasTool.cluster) {
+      _mode = _GestureMode.drawCluster;
+      c.startLocalCluster(scenePos);
+      return;
+    }
+
     if (c.tool == CanvasTool.textCard) {
       c.createTextCard(sceneCenter: scenePos);
       return;
@@ -380,6 +411,15 @@ class _BoardStageState extends State<BoardStage> {
     }
 
     if (c.tool == CanvasTool.select) {
+      final isDoubleTap = (nowMs - _lastSurfaceTapMs) <= 350 &&
+          (scenePos - _lastSurfaceTapScene).distance <= 16.0;
+      if (isDoubleTap) {
+        _lastSurfaceTapMs = 0;
+      } else {
+        _lastSurfaceTapMs = nowMs;
+        _lastSurfaceTapScene = scenePos;
+      }
+
       final groupRect = c.selectionBounds;
       if (c.selectedElementIds.length > 1 &&
           groupRect != null &&
@@ -392,12 +432,32 @@ class _BoardStageState extends State<BoardStage> {
       final hit = c.hitTestElement(scenePos);
       if (hit != null) {
         c.selectElement(hit.id);
+        if (isDoubleTap &&
+            (hit.kind == ElementKind.connector ||
+                hit.kind == ElementKind.cluster)) {
+          _mode = _GestureMode.none;
+          widget.onRequestEditGraphLabel?.call(hit);
+          return;
+        }
+        if (hit.kind == ElementKind.cluster) {
+          _lassoDragOrigins = c.captureClusterDragOrigins(hit.id);
+          _lassoDragStartScene = scenePos;
+          _mode = _GestureMode.dragLassoGroup;
+          return;
+        }
+        if (hit.kind == ElementKind.connector) {
+          _mode = _GestureMode.none;
+          return;
+        }
         _draggingElementId = hit.id;
         _dragOrigX = hit.x;
         _dragOrigY = hit.y;
         _dragOrigW = hit.width;
         _dragOrigH = hit.height;
         _mode = _GestureMode.dragElement;
+      } else if (isDoubleTap && event.kind == PointerDeviceKind.mouse) {
+        c.createMindFlowToken(sceneCenter: scenePos);
+        _mode = _GestureMode.none;
       } else {
         c.clearSelection();
         _mode = _GestureMode.pan;
@@ -436,6 +496,14 @@ class _BoardStageState extends State<BoardStage> {
 
       case _GestureMode.drawShape:
         c.updateLocalShape(scenePos);
+        break;
+
+      case _GestureMode.drawConnector:
+        c.updateLocalConnector(scenePos);
+        break;
+
+      case _GestureMode.drawCluster:
+        c.updateLocalCluster(scenePos);
         break;
 
       case _GestureMode.lasso:
@@ -520,6 +588,20 @@ class _BoardStageState extends State<BoardStage> {
           c.cancelLocalShape();
         }
         break;
+      case _GestureMode.drawConnector:
+        if (event is PointerUpEvent) {
+          c.finishLocalConnector(_toScene(event.localPosition));
+        } else {
+          c.cancelLocalConnector();
+        }
+        break;
+      case _GestureMode.drawCluster:
+        if (event is PointerUpEvent) {
+          c.finishLocalCluster(_toScene(event.localPosition));
+        } else {
+          c.cancelLocalCluster();
+        }
+        break;
       case _GestureMode.lasso:
         if (event is PointerUpEvent) {
           c.finishLasso();
@@ -569,6 +651,7 @@ class _BoardStageState extends State<BoardStage> {
     switch (tool) {
       case CanvasTool.select:
         return SystemMouseCursors.basic;
+      case CanvasTool.token:
       case CanvasTool.textCard:
       case CanvasTool.stickyNote:
       case CanvasTool.image:
@@ -594,6 +677,9 @@ class _BoardStageState extends State<BoardStage> {
             final c = widget.controller;
             final page = c.activePage;
             final elements = c.activeElements;
+            final hasLockedPdfSheets = elements.any(
+              (e) => !e.deleted && e.locked && e.zIndex <= -50,
+            );
 
             return ClipRect(
               child: Listener(
@@ -626,7 +712,7 @@ class _BoardStageState extends State<BoardStage> {
                             panOffset: c.panOffset,
                             zoom: c.zoom,
                             selectedElementId: null,
-                            showPageGuide: c.showPageGuide,
+                            showPageGuide: c.showPageGuide && !hasLockedPdfSheets,
                             paintPaper: true,
                             paintInk: false,
                           ),
@@ -647,13 +733,14 @@ class _BoardStageState extends State<BoardStage> {
                         ),
                       ),
 
-                      // Layer 3: Interactive Markdown, Sticky Note & Image Cards
+                      // Layer 3: Locked PDF lecture sheets (bottom card plane)
                       CanvasCardLayer(
                         controller: c,
                         interactive: _cardsInteractive,
+                        filter: CardLayerFilter.lockedPdfOnly,
                       ),
 
-                      // Layer 4: Committed vector strokes, highlighters & shapes (above cards!)
+                      // Layer 4: MindFlow clusters & causal Bezier connectors
                       IgnorePointer(
                         child: RepaintBoundary(
                           child: CustomPaint(
@@ -665,6 +752,34 @@ class _BoardStageState extends State<BoardStage> {
                               selectedElementId: c.selectedElementId,
                               revision: c.committedInkRevision,
                               paintPaper: false,
+                              paintGraph: true,
+                              paintInk: false,
+                            ),
+                            isComplex: true,
+                          ),
+                        ),
+                      ),
+
+                      // Layer 5: Foreground MindFlow tokens, Markdown cards, Sticky Notes & Images
+                      CanvasCardLayer(
+                        controller: c,
+                        interactive: _cardsInteractive,
+                        filter: CardLayerFilter.foregroundCards,
+                      ),
+
+                      // Layer 6: Committed vector strokes, highlighters & shapes (above cards!)
+                      IgnorePointer(
+                        child: RepaintBoundary(
+                          child: CustomPaint(
+                            painter: CommittedCanvasPainter(
+                              page: page,
+                              elements: elements,
+                              panOffset: c.panOffset,
+                              zoom: c.zoom,
+                              selectedElementId: c.selectedElementId,
+                              revision: c.committedInkRevision,
+                              paintPaper: false,
+                              paintGraph: false,
                               paintInk: true,
                             ),
                             isComplex: true,
@@ -672,7 +787,7 @@ class _BoardStageState extends State<BoardStage> {
                         ),
                       ),
 
-                      // Layer 5: Real-time local & remote strokes, laser & cursors
+                      // Layer 7: Real-time local & remote strokes, connectors, laser & cursors
                       IgnorePointer(
                         child: RepaintBoundary(
                           child: CustomPaint(

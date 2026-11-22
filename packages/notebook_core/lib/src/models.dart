@@ -26,13 +26,53 @@ enum ElementKind {
   shape,
   textCard,
   stickyNote,
-  image;
+  image,
+  token,
+  connector,
+  cluster;
 
   static ElementKind fromName(String? raw) {
     for (final value in ElementKind.values) {
       if (value.name == raw) return value;
     }
     return ElementKind.stroke;
+  }
+}
+
+enum MindFlowColor {
+  yellow('灵感黄', 0xFFF59E0B, 0xFFFEF9C3, 0xFF713F12),
+  blue('核心蓝', 0xFF3B82F6, 0xFFDBEAFE, 0xFF1E3A8A),
+  green('行动绿', 0xFF10B981, 0xFFD1FAE5, 0xFF064E3B),
+  purple('洞察紫', 0xFF8B5CF6, 0xFFEDE9FE, 0xFF4C1D95),
+  red('质疑红', 0xFFEF4444, 0xFFFEE2E2, 0xFF7F1D1D),
+  neutral('中性灰', 0xFF94A3B8, 0xFFFFFFFF, 0xFF0F172A);
+
+  const MindFlowColor(this.label, this.borderArgb, this.fillArgb, this.textArgb);
+  final String label;
+  final int borderArgb;
+  final int fillArgb;
+  final int textArgb;
+
+  static MindFlowColor fromName(String? raw) {
+    for (final c in MindFlowColor.values) {
+      if (c.name == raw) return c;
+    }
+    return MindFlowColor.neutral;
+  }
+
+  static MindFlowColor fromColorValue(int argb) {
+    for (final c in MindFlowColor.values) {
+      if (c.borderArgb == argb || c.fillArgb == argb) return c;
+    }
+    final r = (argb >> 16) & 0xFF;
+    final g = (argb >> 8) & 0xFF;
+    final b = argb & 0xFF;
+    if (r > 200 && g > 170 && b < 140) return MindFlowColor.yellow;
+    if (r > 190 && g < 110 && b < 110) return MindFlowColor.red;
+    if (g > 150 && r < 140) return MindFlowColor.green;
+    if (r > 120 && b > 180 && g < 130) return MindFlowColor.purple;
+    if (b > 180 && r < 120) return MindFlowColor.blue;
+    return MindFlowColor.neutral;
   }
 }
 
@@ -219,6 +259,9 @@ class CanvasElementModel {
     required this.updatedAtMs,
     this.fillColorValue = 0,
     this.locked = false,
+    this.sourceId = '',
+    this.targetId = '',
+    this.semanticColor = MindFlowColor.neutral,
   });
 
   final String id;
@@ -241,6 +284,14 @@ class CanvasElementModel {
   final bool deleted;
   final int updatedAtMs;
   final bool locked;
+  final String sourceId;
+  final String targetId;
+  final MindFlowColor semanticColor;
+
+  bool get isConnectibleNode =>
+      kind == ElementKind.token ||
+      kind == ElementKind.stickyNote ||
+      kind == ElementKind.textCard;
 
   ElementBounds get bounds {
     if (kind == ElementKind.stroke || kind == ElementKind.highlighter) {
@@ -305,8 +356,31 @@ class CanvasElementModel {
       return false;
     }
 
-    if (kind == ElementKind.shape &&
-        (shapeKind == ShapeKind.line || shapeKind == ShapeKind.arrow)) {
+    if (kind == ElementKind.cluster) {
+      final headerBottom = math.min(b.bottom, b.top + 38.0);
+      final inHeader = wx >= b.left - tolerance &&
+          wx <= b.right + tolerance &&
+          wy >= b.top - tolerance &&
+          wy <= headerBottom;
+      if (inHeader) return true;
+      final nearLeft = (wx - b.left).abs() <= tolerance &&
+          wy >= b.top - tolerance &&
+          wy <= b.bottom + tolerance;
+      final nearRight = (wx - b.right).abs() <= tolerance &&
+          wy >= b.top - tolerance &&
+          wy <= b.bottom + tolerance;
+      final nearTop = (wy - b.top).abs() <= tolerance &&
+          wx >= b.left - tolerance &&
+          wx <= b.right + tolerance;
+      final nearBottom = (wy - b.bottom).abs() <= tolerance &&
+          wx >= b.left - tolerance &&
+          wx <= b.right + tolerance;
+      return nearLeft || nearRight || nearTop || nearBottom;
+    }
+
+    if (kind == ElementKind.connector ||
+        (kind == ElementKind.shape &&
+            (shapeKind == ShapeKind.line || shapeKind == ShapeKind.arrow))) {
       final dist = _distancePointToSegment(
         wx,
         wy,
@@ -315,7 +389,7 @@ class CanvasElementModel {
         x + width,
         y + height,
       );
-      return dist <= tolerance + strokeWidth * 0.5;
+      return dist <= tolerance + strokeWidth * 0.5 + 4.0;
     }
 
     return b.contains(wx, wy, padding: tolerance * 0.5);
@@ -359,6 +433,7 @@ class PeerPresence {
     required this.cursorY,
     required this.cursorVisible,
     required this.lastSeenMs,
+    this.selectedElementIds = const <String>[],
   });
 
   final String peerId;
@@ -371,6 +446,7 @@ class PeerPresence {
   final double cursorY;
   final bool cursorVisible;
   final int lastSeenMs;
+  final List<String> selectedElementIds;
 
   PeerPresence copyWith({
     String? displayName,
@@ -382,6 +458,7 @@ class PeerPresence {
     double? cursorY,
     bool? cursorVisible,
     int? lastSeenMs,
+    List<String>? selectedElementIds,
   }) {
     return PeerPresence(
       peerId: peerId,
@@ -394,6 +471,7 @@ class PeerPresence {
       cursorY: cursorY ?? this.cursorY,
       cursorVisible: cursorVisible ?? this.cursorVisible,
       lastSeenMs: lastSeenMs ?? this.lastSeenMs,
+      selectedElementIds: selectedElementIds ?? this.selectedElementIds,
     );
   }
 
@@ -408,9 +486,12 @@ class PeerPresence {
         'cursorY': _round2(cursorY),
         'cursorVisible': cursorVisible,
         'lastSeenMs': lastSeenMs,
+        if (selectedElementIds.isNotEmpty)
+          'selectedElementIds': selectedElementIds,
       };
 
   factory PeerPresence.fromJson(Map<String, dynamic> json) {
+    final rawSelected = json['selectedElementIds'] as List<dynamic>?;
     return PeerPresence(
       peerId: json['peerId'] as String? ?? 'peer',
       displayName: json['displayName'] as String? ?? '协作者',
@@ -422,6 +503,9 @@ class PeerPresence {
       cursorY: (json['cursorY'] as num? ?? 0).toDouble(),
       cursorVisible: json['cursorVisible'] as bool? ?? false,
       lastSeenMs: (json['lastSeenMs'] as num? ?? 0).toInt(),
+      selectedElementIds: rawSelected == null
+          ? const <String>[]
+          : rawSelected.map((e) => e.toString()).toList(),
     );
   }
 }

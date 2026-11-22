@@ -598,4 +598,207 @@ void main() {
       } catch (_) {}
     }
   });
+
+  test(
+    'MindFlow MCP server supports read-only gating, expectedRevision locking, live CRDT WebSocket broadcast, and 20-version backup restore',
+    () async {
+      final tempRoot =
+          await Directory.systemTemp.createTemp('sync_canvas_mindflow_mcp_');
+      final dataDir = Directory('${tempRoot.path}/data');
+      final server = SyncServer();
+      await server.start(
+        host: '127.0.0.1',
+        port: 0,
+        dataDir: dataDir.path,
+        apkPath: null,
+      );
+
+      final client = HttpClient();
+      final wsPeer = _TestPeerClient(
+        peerId: 'peer-tablet-mcp',
+        displayName: 'iPad Viewer',
+        formFactor: DeviceFormFactor.tablet,
+        colorValue: 0xFF0D9488,
+      );
+
+      Future<Map<String, dynamic>> postMcp(
+        Map<String, dynamic> rpc, {
+        bool readOnly = false,
+      }) async {
+        final ro = readOnly ? '1' : '0';
+        final req = await client.post(
+          '127.0.0.1',
+          server.boundPort,
+          '/api/rooms/mcp-room/mindflow/mcp?readOnly=$ro',
+        );
+        req.headers.contentType = ContentType.json;
+        req.write(jsonEncode(rpc));
+        final resp = await req.close();
+        expect(resp.statusCode, HttpStatus.ok);
+        return jsonDecode(await utf8.decoder.bind(resp).join())
+            as Map<String, dynamic>;
+      }
+
+      try {
+        await wsPeer.connect(server.boundPort, roomId: 'mcp-room');
+
+        // 1. initialize + tools/list in readOnly mode excludes write tools
+        final initResp = await postMcp(<String, dynamic>{
+          'jsonrpc': '2.0',
+          'id': 1,
+          'method': 'initialize',
+          'params': <String, dynamic>{'protocolVersion': '2024-11-05'},
+        }, readOnly: true);
+        expect((initResp['result'] as Map)['serverInfo']['name'], 'mindflow');
+
+        final roTools = await postMcp(<String, dynamic>{
+          'jsonrpc': '2.0',
+          'id': 2,
+          'method': 'tools/list',
+        }, readOnly: true);
+        final roNames = ((roTools['result'] as Map)['tools'] as List)
+            .map((t) => (t as Map)['name'])
+            .toList();
+        expect(roNames, contains('mindflow_get_board'));
+        expect(roNames, isNot(contains('mindflow_apply_operations')));
+
+        // 2. Read skill resource & get current revision
+        final skillRes = await postMcp(<String, dynamic>{
+          'jsonrpc': '2.0',
+          'id': 3,
+          'method': 'resources/read',
+          'params': <String, dynamic>{'uri': 'mindflow://skill'},
+        }, readOnly: true);
+        expect(
+          ((skillRes['result'] as Map)['contents'] as List).first['text'],
+          contains('yellow'),
+        );
+
+        final boardRes = await postMcp(<String, dynamic>{
+          'jsonrpc': '2.0',
+          'id': 4,
+          'method': 'tools/call',
+          'params': <String, dynamic>{'name': 'mindflow_get_board'},
+        }, readOnly: true);
+        final rev0 =
+            ((boardRes['result'] as Map)['structuredContent'] as Map)['revision']
+                as int;
+
+        // 3. Attempting write in readOnly mode fails cleanly
+        final deniedWrite = await postMcp(<String, dynamic>{
+          'jsonrpc': '2.0',
+          'id': 5,
+          'method': 'tools/call',
+          'params': <String, dynamic>{
+            'name': 'mindflow_apply_operations',
+            'arguments': <String, dynamic>{
+              'expectedRevision': rev0,
+              'operations': <Map<String, dynamic>>[
+                <String, dynamic>{
+                  'action': 'upsert',
+                  'collection': 'tokens',
+                  'item': <String, dynamic>{
+                    'id': 'mcp_tk_1',
+                    'text': 'Denied in readonly',
+                    'x': 120,
+                    'y': 140,
+                    'color': 'yellow',
+                  },
+                },
+              ],
+            },
+          },
+        }, readOnly: true);
+        expect((deniedWrite['result'] as Map)['isError'], isTrue);
+
+        // 4. Write with readOnly=false -> updates doc, saves rolling backup & broadcasts live over WebSocket!
+        final writeResp = await postMcp(<String, dynamic>{
+          'jsonrpc': '2.0',
+          'id': 6,
+          'method': 'tools/call',
+          'params': <String, dynamic>{
+            'name': 'mindflow_apply_operations',
+            'arguments': <String, dynamic>{
+              'expectedRevision': rev0,
+              'operations': <Map<String, dynamic>>[
+                <String, dynamic>{
+                  'action': 'upsert',
+                  'collection': 'tokens',
+                  'item': <String, dynamic>{
+                    'id': 'mcp_tk_1',
+                    'text': 'AI 生成的架构节点',
+                    'x': 200,
+                    'y': 180,
+                    'color': 'blue',
+                  },
+                },
+              ],
+            },
+          },
+        }, readOnly: false);
+        final writeResult = writeResp['result'] as Map;
+        expect(writeResult['isError'], isNot(true));
+        expect(
+          (writeResult['structuredContent'] as Map)['revision'],
+          rev0 + 1,
+        );
+
+        await _waitUntil(() => wsPeer.doc.getElement('mcp_tk_1') != null);
+        expect(wsPeer.doc.getElement('mcp_tk_1')!.text, 'AI 生成的架构节点');
+
+        // 5. Stale expectedRevision rejects with REVISION_CONFLICT
+        final conflictResp = await postMcp(<String, dynamic>{
+          'jsonrpc': '2.0',
+          'id': 7,
+          'method': 'tools/call',
+          'params': <String, dynamic>{
+            'name': 'mindflow_rename_board',
+            'arguments': <String, dynamic>{
+              'expectedRevision': rev0, // stale!
+              'title': 'Should conflict',
+            },
+          },
+        }, readOnly: false);
+        expect((conflictResp['result'] as Map)['isError'], isTrue);
+        expect(
+          ((conflictResp['result'] as Map)['content'] as List).first['text'],
+          contains('REVISION_CONFLICT'),
+        );
+
+        // 6. List rolling backups & restore rev0 (rolling back mcp_tk_1 live!)
+        final bkReq = await client.get(
+          '127.0.0.1',
+          server.boundPort,
+          '/api/rooms/mcp-room/mindflow/backups',
+        );
+        final bkResp = await bkReq.close();
+        final bkJson =
+            jsonDecode(await utf8.decoder.bind(bkResp).join())
+                as Map<String, dynamic>;
+        expect((bkJson['backups'] as List).length, greaterThanOrEqualTo(1));
+
+        final restoreReq = await client.post(
+          '127.0.0.1',
+          server.boundPort,
+          '/api/rooms/mcp-room/mindflow/restore',
+        );
+        restoreReq.headers.contentType = ContentType.json;
+        restoreReq.write(jsonEncode(<String, dynamic>{'revision': rev0}));
+        final restoreResp = await restoreReq.close();
+        expect(restoreResp.statusCode, HttpStatus.ok);
+        await restoreResp.drain<void>();
+
+        await _waitUntil(
+          () => wsPeer.doc.getElement('mcp_tk_1')?.deleted == true,
+        );
+      } finally {
+        client.close(force: true);
+        await wsPeer.dispose();
+        await server.close();
+        try {
+          await tempRoot.delete(recursive: true);
+        } catch (_) {}
+      }
+    },
+  );
 }

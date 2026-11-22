@@ -162,7 +162,11 @@ bool isPointInPolygon(Offset pt, List<Offset> polygon) {
 
 /// Returns true when [el] should be captured by a freehand lasso [polygon].
 /// Locked elements (such as PDF background sheets) are never captured.
-bool elementMatchesLasso(CanvasElementModel el, List<Offset> polygon) {
+bool elementMatchesLasso(
+  CanvasElementModel el,
+  List<Offset> polygon, {
+  Map<String, CanvasElementModel>? elementsById,
+}) {
   if (el.deleted || el.locked || polygon.length < 3) return false;
 
   var minX = polygon.first.dx;
@@ -176,9 +180,61 @@ bool elementMatchesLasso(CanvasElementModel el, List<Offset> polygon) {
     if (p.dy > maxY) maxY = p.dy;
   }
   final polyBounds = Rect.fromLTRB(minX, minY, maxX, maxY);
+
+  if (el.kind == ElementKind.connector) {
+    final curve = elementsById != null
+        ? computeConnectorCurve(el, elementsById)
+        : null;
+    if (curve != null) {
+      final cxMin = math.min(curve.sx, curve.tx);
+      final cxMax = math.max(curve.sx, curve.tx);
+      final cyMin = math.min(curve.sy, curve.ty);
+      final cyMax = math.max(curve.sy, curve.ty);
+      final curveRect = Rect.fromLTRB(cxMin, cyMin, cxMax, cyMax).inflate(16.0);
+      if (!polyBounds.overlaps(curveRect)) return false;
+      return isPointInPolygon(Offset(curve.midX, curve.midY), polygon) ||
+          isPointInPolygon(Offset(curve.sx, curve.sy), polygon) ||
+          isPointInPolygon(Offset(curve.tx, curve.ty), polygon);
+    }
+    final fallbackRect = Rect.fromLTRB(
+      math.min(el.x, el.x + el.width),
+      math.min(el.y, el.y + el.height),
+      math.max(el.x, el.x + el.width),
+      math.max(el.y, el.y + el.height),
+    ).inflate(12.0);
+    if (!polyBounds.overlaps(fallbackRect)) return false;
+    return isPointInPolygon(fallbackRect.center, polygon) ||
+        isPointInPolygon(Offset(el.x, el.y), polygon) ||
+        isPointInPolygon(Offset(el.x + el.width, el.y + el.height), polygon);
+  }
+
   final rawB = el.bounds;
   final eb = Rect.fromLTRB(rawB.left, rawB.top, rawB.right, rawB.bottom);
   if (!polyBounds.overlaps(eb.inflate(6.0))) return false;
+
+  if (el.kind == ElementKind.cluster) {
+    final headerPoint = Offset(
+      math.min(eb.right, eb.left + 64.0),
+      eb.top + 16.0,
+    );
+    if (isPointInPolygon(headerPoint, polygon) ||
+        isPointInPolygon(eb.center, polygon)) {
+      return true;
+    }
+    var corners = 0;
+    for (final corner in <Offset>[
+      eb.topLeft,
+      eb.topRight,
+      eb.bottomLeft,
+      eb.bottomRight,
+    ]) {
+      if (isPointInPolygon(corner, polygon)) {
+        corners += 1;
+        if (corners >= 2) return true;
+      }
+    }
+    return false;
+  }
 
   if (el.kind == ElementKind.stroke || el.kind == ElementKind.highlighter) {
     if (el.points.isEmpty) {

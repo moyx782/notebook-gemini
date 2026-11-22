@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../state/notebook_controller.dart';
 
@@ -171,7 +172,7 @@ Future<void> showImportPdfDialog(
   BuildContext context,
   NotebookController controller,
 ) async {
-  var asNewNotebook = false;
+  var placement = PdfImportPlacement.newSinglePage;
   var maxPages = 30;
   var isImporting = false;
   String? errorMsg;
@@ -201,7 +202,7 @@ Future<void> showImportPdfDialog(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
                   const Text(
-                    '将 PDF 每一页高清渲染为独立画板页，并自动锁定为防误擦底图，支持触控笔书写、荧光笔划重点与多端实时同步批注。',
+                    '将多页 PDF 按阅读顺序从上到下连续渲染在同一个画板页上，并自动锁定为防误擦底图，支持上下滚动手写批注、荧光笔划重点与多端实时同步。',
                     style: TextStyle(
                       fontSize: 12.5,
                       height: 1.45,
@@ -218,20 +219,14 @@ Future<void> showImportPdfDialog(
                     spacing: 8,
                     runSpacing: 8,
                     children: <Widget>[
-                      ChoiceChip(
-                        label: const Text('追加到当前笔记本'),
-                        selected: !asNewNotebook,
-                        onSelected: isImporting
-                            ? null
-                            : (_) => setStateDialog(() => asNewNotebook = false),
-                      ),
-                      ChoiceChip(
-                        label: const Text('新建独立讲义笔记本'),
-                        selected: asNewNotebook,
-                        onSelected: isImporting
-                            ? null
-                            : (_) => setStateDialog(() => asNewNotebook = true),
-                      ),
+                      for (final option in PdfImportPlacement.values)
+                        ChoiceChip(
+                          label: Text(option.label),
+                          selected: placement == option,
+                          onSelected: isImporting
+                              ? null
+                              : (_) => setStateDialog(() => placement = option),
+                        ),
                     ],
                   ),
                   const SizedBox(height: 14),
@@ -244,7 +239,7 @@ Future<void> showImportPdfDialog(
                     spacing: 8,
                     runSpacing: 8,
                     children: <Widget>[
-                      for (final count in const <int>[15, 30, 60])
+                      for (final count in const <int>[15, 30, 60, 100])
                         ChoiceChip(
                           label: Text('前 $count 页'),
                           selected: maxPages == count,
@@ -336,7 +331,7 @@ Future<void> showImportPdfDialog(
                       }
                       final importedCount = await controller.importPdfDocument(
                         doc,
-                        asNewNotebook: asNewNotebook,
+                        placement: placement,
                       );
                       if (!ctx.mounted) return;
                       Navigator.of(ctx).pop();
@@ -345,7 +340,7 @@ Future<void> showImportPdfDialog(
                           behavior: SnackBarBehavior.floating,
                           margin: const EdgeInsets.fromLTRB(16, 0, 16, 82),
                           content: Text(
-                            '已导入《${doc.fileName}》共 $importedCount 页（底图默认防误擦锁定，可直接手写批注）',
+                            '已将《${doc.fileName}》共 $importedCount 页连续渲染至同一画板页（底图防误擦锁定，可上下滚动批注）',
                           ),
                         ),
                       );
@@ -429,6 +424,106 @@ class LassoSelectionActionBar extends StatelessWidget {
               const SizedBox(width: 4),
               InkWell(
                 borderRadius: BorderRadius.circular(999),
+                onTap: () => controller.groupSelectionIntoCluster(),
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  child: Row(
+                    children: <Widget>[
+                      Icon(Icons.workspaces_outline, size: 14, color: Color(0xFF4F46E5)),
+                      SizedBox(width: 4),
+                      Text(
+                        '编组',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF312E81),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                borderRadius: BorderRadius.circular(999),
+                onTap: () => controller.alignSelectedElements(horizontal: true),
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+                  child: Row(
+                    children: <Widget>[
+                      Icon(Icons.view_column_outlined, size: 14, color: Color(0xFF334155)),
+                      SizedBox(width: 3),
+                      Text(
+                        '横排',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF334155),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                borderRadius: BorderRadius.circular(999),
+                onTap: () => controller.alignSelectedElements(horizontal: false),
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+                  child: Row(
+                    children: <Widget>[
+                      Icon(Icons.view_agenda_outlined, size: 14, color: Color(0xFF334155)),
+                      SizedBox(width: 3),
+                      Text(
+                        '竖排',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF334155),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                borderRadius: BorderRadius.circular(999),
+                onTap: () {
+                  Clipboard.setData(
+                    ClipboardData(
+                      text: controller.buildActivePageAiSkillBundle(
+                        scope: 'selected',
+                      ),
+                    ),
+                  );
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      duration: Duration(milliseconds: 1400),
+                      behavior: SnackBarBehavior.floating,
+                      margin: EdgeInsets.fromLTRB(16, 0, 16, 82),
+                      content: Text('已复制选中区域的 MindFlow AI 上下文与技能规范'),
+                    ),
+                  );
+                },
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+                  child: Row(
+                    children: <Widget>[
+                      Icon(Icons.auto_awesome_outlined, size: 14, color: Color(0xFF0F766E)),
+                      SizedBox(width: 3),
+                      Text(
+                        'AI 上下文',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF0F766E),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                borderRadius: BorderRadius.circular(999),
                 onTap: () => controller.duplicateSelectedElements(),
                 child: const Padding(
                   padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -501,6 +596,7 @@ class DraggableCanvasToolbar extends StatefulWidget {
     required this.compact,
     required this.onInsertImage,
     this.onImportPdf,
+    this.onOpenMindFlowAi,
   });
 
   final NotebookController controller;
@@ -508,6 +604,7 @@ class DraggableCanvasToolbar extends StatefulWidget {
   final bool compact;
   final VoidCallback onInsertImage;
   final VoidCallback? onImportPdf;
+  final VoidCallback? onOpenMindFlowAi;
 
   @override
   State<DraggableCanvasToolbar> createState() => _DraggableCanvasToolbarState();
@@ -709,6 +806,7 @@ class _DraggableCanvasToolbarState extends State<DraggableCanvasToolbar> {
                       maxMainAxisExtent: maxExtent,
                       onInsertImage: widget.onInsertImage,
                       onImportPdf: widget.onImportPdf,
+                      onOpenMindFlowAi: widget.onOpenMindFlowAi,
                       onDragStart: _onDragStart,
                       onDragUpdate: _onDragUpdate,
                       onDragEnd: _onDragEnd,
@@ -895,6 +993,7 @@ class CanvasToolbar extends StatelessWidget {
     required this.compact,
     required this.onInsertImage,
     this.onImportPdf,
+    this.onOpenMindFlowAi,
     this.direction = Axis.horizontal,
     this.maxMainAxisExtent,
     this.onDragStart,
@@ -909,6 +1008,7 @@ class CanvasToolbar extends StatelessWidget {
   final bool compact;
   final VoidCallback onInsertImage;
   final VoidCallback? onImportPdf;
+  final VoidCallback? onOpenMindFlowAi;
   final Axis direction;
   final double? maxMainAxisExtent;
   final GestureDragStartCallback? onDragStart;
@@ -1058,6 +1158,27 @@ class CanvasToolbar extends StatelessWidget {
                       ),
                       _ShapeMenuBtn(controller: c),
                       _ToolBtn(
+                        icon: Icons.hub_outlined,
+                        tooltip: '概念词块 (N)',
+                        selected: c.tool == CanvasTool.token,
+                        compactPadding: compact,
+                        onTap: () => c.setTool(CanvasTool.token),
+                      ),
+                      _ToolBtn(
+                        icon: Icons.timeline_rounded,
+                        tooltip: '因果连线 (C)',
+                        selected: c.tool == CanvasTool.connector,
+                        compactPadding: compact,
+                        onTap: () => c.setTool(CanvasTool.connector),
+                      ),
+                      _ToolBtn(
+                        icon: Icons.dashboard_customize_outlined,
+                        tooltip: '区域分组 (B)',
+                        selected: c.tool == CanvasTool.cluster,
+                        compactPadding: compact,
+                        onTap: () => c.setTool(CanvasTool.cluster),
+                      ),
+                      _ToolBtn(
                         icon: Icons.article_outlined,
                         tooltip: '插入 Markdown 卡片 (T)',
                         selected: c.tool == CanvasTool.textCard,
@@ -1085,6 +1206,14 @@ class CanvasToolbar extends StatelessWidget {
                           selected: false,
                           compactPadding: compact,
                           onTap: onImportPdf,
+                        ),
+                      if (onOpenMindFlowAi != null)
+                        _ToolBtn(
+                          icon: Icons.auto_awesome_outlined,
+                          tooltip: 'MindFlow AI 协同与 MCP',
+                          selected: false,
+                          compactPadding: compact,
+                          onTap: onOpenMindFlowAi,
                         ),
                       _ToolBtn(
                         icon: Icons.flare_rounded,
@@ -1246,6 +1375,27 @@ class CanvasToolbar extends StatelessWidget {
                       ),
                       _ShapeMenuBtn(controller: c),
                       _ToolBtn(
+                        icon: Icons.hub_outlined,
+                        tooltip: '概念词块 (N)',
+                        selected: c.tool == CanvasTool.token,
+                        compactPadding: compact,
+                        onTap: () => c.setTool(CanvasTool.token),
+                      ),
+                      _ToolBtn(
+                        icon: Icons.timeline_rounded,
+                        tooltip: '因果连线 (C)',
+                        selected: c.tool == CanvasTool.connector,
+                        compactPadding: compact,
+                        onTap: () => c.setTool(CanvasTool.connector),
+                      ),
+                      _ToolBtn(
+                        icon: Icons.dashboard_customize_outlined,
+                        tooltip: '区域分组 (B)',
+                        selected: c.tool == CanvasTool.cluster,
+                        compactPadding: compact,
+                        onTap: () => c.setTool(CanvasTool.cluster),
+                      ),
+                      _ToolBtn(
                         icon: Icons.article_outlined,
                         tooltip: '插入 Markdown 卡片 (T)',
                         selected: c.tool == CanvasTool.textCard,
@@ -1269,6 +1419,13 @@ class CanvasToolbar extends StatelessWidget {
                           tooltip: '导入 PDF 讲义',
                           selected: false,
                           onTap: onImportPdf,
+                        ),
+                      if (onOpenMindFlowAi != null)
+                        _ToolBtn(
+                          icon: Icons.auto_awesome_outlined,
+                          tooltip: 'MindFlow AI 协同与 MCP',
+                          selected: false,
+                          onTap: onOpenMindFlowAi,
                         ),
                       _ToolBtn(
                         icon: Icons.flare_rounded,

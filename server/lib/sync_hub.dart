@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:notebook_core/notebook_core.dart';
 
 import 'lan_info.dart';
+import 'mindflow_mcp_service.dart';
 import 'storage.dart';
 
 class _ConnectedPeer {
@@ -22,11 +23,13 @@ class _RoomState {
     required this.roomId,
     required this.document,
     required this.storage,
+    required this.mindflow,
   });
 
   final String roomId;
   final CrdtDocument document;
   final RoomStorage storage;
+  final MindFlowMcpService mindflow;
   final Map<String, _ConnectedPeer> peers = <String, _ConnectedPeer>{};
 }
 
@@ -101,10 +104,26 @@ class SyncServer {
       try {
         final storage = RoomStorage(dataDir: _dataDir, roomId: roomId);
         final doc = await storage.loadOrSeed();
-        final room = _RoomState(
+        late final _RoomState room;
+        final mindflow = MindFlowMcpService(
+          dataDir: _dataDir,
+          roomId: roomId,
+          document: doc,
+          onOpsCommitted: (ops) async {
+            storage.appendOps(ops, doc);
+            final relay = SyncMessage.opBatch(
+              roomId: roomId,
+              senderId: 'mindflow-mcp',
+              ops: ops,
+            ).encode();
+            _broadcast(room, relay);
+          },
+        );
+        room = _RoomState(
           roomId: roomId,
           document: doc,
           storage: storage,
+          mindflow: mindflow,
         );
         _rooms[roomId] = room;
         return room;
@@ -242,7 +261,8 @@ class SyncServer {
   Future<void> _handleRoomApi(HttpRequest request) async {
     final segments = request.uri.pathSegments;
     // Expected: ['api', 'rooms', '<roomId>', 'export' | 'import']
-    if (segments.length != 4) {
+    //       or: ['api', 'rooms', '<roomId>', 'mindflow', 'mcp' | 'backups' | 'restore']
+    if (segments.length < 4) {
       request.response.statusCode = HttpStatus.notFound;
       await _writeJson(request.response, <String, dynamic>{
         'ok': false,
@@ -254,6 +274,20 @@ class SyncServer {
     final roomId = sanitizeRoomId(segments[2]);
     final action = segments[3];
     final room = await _getOrLoadRoom(roomId);
+
+    if (action == 'mindflow' && segments.length == 5) {
+      await _handleMindFlowApi(request, room, segments[4]);
+      return;
+    }
+
+    if (segments.length != 4) {
+      request.response.statusCode = HttpStatus.notFound;
+      await _writeJson(request.response, <String, dynamic>{
+        'ok': false,
+        'error': 'Unknown room endpoint',
+      });
+      return;
+    }
 
     if (request.method == 'GET' && action == 'export') {
       _applyCors(request.response);
@@ -281,6 +315,7 @@ class SyncServer {
       await room.storage.saveSnapshotNow(room.document);
 
       if (changed) {
+        room.mindflow.bumpExternalRevision();
         final ips = await discoverLanIpv4Addresses();
         final port = boundPort;
         final lanWs = ips.map((ip) => 'ws://$ip:$port/ws').toList();
@@ -312,6 +347,103 @@ class SyncServer {
     await _writeJson(request.response, <String, dynamic>{
       'ok': false,
       'error': 'Unsupported method or action',
+    });
+  }
+
+  Future<void> _handleMindFlowApi(
+    HttpRequest request,
+    _RoomState room,
+    String subAction,
+  ) async {
+    if (subAction == 'mcp' && request.method == 'POST') {
+      final roRaw =
+          request.uri.queryParameters['readOnly']?.trim().toLowerCase() ?? '1';
+      final readOnly = roRaw != '0' && roRaw != 'false';
+      final rawBody = await utf8.decoder.bind(request).join();
+      final decoded = jsonDecode(rawBody);
+      _applyCors(request.response);
+
+      if (decoded is List) {
+        final responses = <Map<String, dynamic>>[];
+        for (final item in decoded) {
+          if (item is Map) {
+            final res = await room.mindflow.handleJsonRpc(
+              Map<String, dynamic>.from(item),
+              readOnly: readOnly,
+            );
+            if (res != null) responses.add(res);
+          }
+        }
+        if (responses.isEmpty) {
+          request.response.statusCode = HttpStatus.accepted;
+          await request.response.close();
+        } else {
+          request.response.headers.contentType = ContentType.json;
+          request.response.write(jsonEncode(responses));
+          await request.response.close();
+        }
+        return;
+      }
+
+      if (decoded is Map) {
+        final res = await room.mindflow.handleJsonRpc(
+          Map<String, dynamic>.from(decoded),
+          readOnly: readOnly,
+        );
+        if (res == null) {
+          request.response.statusCode = HttpStatus.accepted;
+          await request.response.close();
+        } else {
+          request.response.headers.contentType = ContentType.json;
+          request.response.write(jsonEncode(res));
+          await request.response.close();
+        }
+        return;
+      }
+
+      request.response.statusCode = HttpStatus.badRequest;
+      await _writeJson(request.response, <String, dynamic>{
+        'ok': false,
+        'error': 'Invalid JSON-RPC payload',
+      });
+      return;
+    }
+
+    if (subAction == 'backups' && request.method == 'GET') {
+      final backups = await room.mindflow.listBackups();
+      await _writeJson(request.response, <String, dynamic>{
+        'ok': true,
+        'revision': room.mindflow.revision,
+        'backups': backups,
+      });
+      return;
+    }
+
+    if (subAction == 'restore' && request.method == 'POST') {
+      final body = await utf8.decoder.bind(request).join();
+      final parsed = jsonDecode(body) as Map<String, dynamic>;
+      final rev = (parsed['revision'] as num?)?.toInt();
+      if (rev == null) {
+        request.response.statusCode = HttpStatus.badRequest;
+        await _writeJson(request.response, <String, dynamic>{
+          'ok': false,
+          'error': 'Missing revision',
+        });
+        return;
+      }
+      final board = await room.mindflow.restoreBackup(rev);
+      await room.storage.saveSnapshotNow(room.document);
+      await _writeJson(request.response, <String, dynamic>{
+        'ok': true,
+        'board': board,
+      });
+      return;
+    }
+
+    request.response.statusCode = HttpStatus.notFound;
+    await _writeJson(request.response, <String, dynamic>{
+      'ok': false,
+      'error': 'Unknown MindFlow endpoint: $subAction',
     });
   }
 
@@ -358,6 +490,7 @@ class SyncServer {
                 lastSeenMs: DateTime.now().millisecondsSinceEpoch,
               ),
             );
+            room.mindflow.updateClientPresence(peer);
 
             final ips = await discoverLanIpv4Addresses();
             final port = boundPort;
@@ -397,6 +530,7 @@ class SyncServer {
             final applied = room.document.applyOps(ops);
             if (applied.isNotEmpty) {
               room.storage.appendOps(applied, room.document);
+              room.mindflow.bumpExternalRevision();
               final relay = SyncMessage.opBatch(
                 roomId: roomId,
                 senderId: msg.senderId,
@@ -420,6 +554,7 @@ class SyncServer {
               room.peers[peer.peerId] =
                   _ConnectedPeer(socket: socket, presence: updated);
             }
+            room.mindflow.updateClientPresence(updated);
             _broadcast(
               room,
               SyncMessage.presence(roomId: roomId, peer: updated).encode(),

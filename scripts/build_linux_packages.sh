@@ -80,6 +80,12 @@ if ! grep -Eq '"useLocalCanvasKit"[[:space:]]*:[[:space:]]*true' "$BUNDLE_DIR/we
   exit 1
 fi
 
+echo "==> Embedding MindFlow MCP bridge & AI skill into $BUNDLE_DIR/mcp..."
+mkdir -p "$BUNDLE_DIR/mcp"
+cp "$ROOT_DIR/scripts/mindflow_mcp_bridge.mjs" "$BUNDLE_DIR/mcp/mindflow_mcp_bridge.mjs"
+chmod 0755 "$BUNDLE_DIR/mcp/mindflow_mcp_bridge.mjs"
+cp "$ROOT_DIR/skills/mindflow-whiteboard/SKILL.md" "$BUNDLE_DIR/mcp/SKILL.md"
+
 DESKTOP_FILE="$ROOT_DIR/packaging/linux/sync-canvas-notebook.desktop"
 SVG_ICON="$ROOT_DIR/packaging/linux/sync-canvas-notebook.svg"
 PNG_ICON="$ROOT_DIR/web/icons/Icon-512.png"

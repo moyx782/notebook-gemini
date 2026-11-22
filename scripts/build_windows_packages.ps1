@@ -123,6 +123,12 @@ if ($bootstrapContent -notmatch '"useLocalCanvasKit"\s*:\s*true') {
 }
 Write-Host "==> Verified offline Web bundle inside $StageWebDir (useLocalCanvasKit=true)"
 
+$StageMcpDir = Join-Path $StageAppDir 'mcp'
+New-Item -ItemType Directory -Force -Path $StageMcpDir | Out-Null
+Copy-Item -Path (Join-Path $RootDir 'scripts\mindflow_mcp_bridge.mjs') -Destination (Join-Path $StageMcpDir 'mindflow_mcp_bridge.mjs') -Force
+Copy-Item -Path (Join-Path $RootDir 'skills\mindflow-whiteboard\SKILL.md') -Destination (Join-Path $StageMcpDir 'SKILL.md') -Force
+Write-Host "==> Bundled MindFlow MCP bridge & AI skill into $StageMcpDir"
+
 # Bundle MSVC C++ Runtime DLLs if available from Visual Studio Redist
 $vswhereCandidates = @(
   "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe",

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -733,7 +734,7 @@ void main() {
   );
 
   testWidgets(
-    'Multi-page PDF import creates locked PDF pages immune to eraser, supports search/bookmark, and exports PNG & Markdown',
+    'Multi-page PDF import renders all pages continuously on ONE locked canvas page immune to eraser, supports search/bookmark, and exports PNG & Markdown',
     (WidgetTester tester) async {
       final adapter = _FakeAndroidPlatformAdapter();
       addTearDown(adapter.dispose);
@@ -755,7 +756,7 @@ void main() {
 
       final initialPageCount = ctrl.activePages.length;
 
-      // 1. Import 2-page PDF via toolbar dialog
+      // 1. Import 2-page PDF via toolbar dialog -> creates ONLY ONE continuous canvas page
       await tester.tap(find.byTooltip('导入 PDF 讲义'));
       await tester.pumpAndSettle();
       expect(find.text('导入 PDF 讲义 / 文档'), findsOneWidget);
@@ -763,56 +764,86 @@ void main() {
       await tester.tap(find.text('选择 PDF 并导入'));
       await tester.pumpAndSettle();
 
-      expect(ctrl.activePages.length, initialPageCount + 2);
-      expect(ctrl.activePage!.title, '线性代数讲义 · P1');
+      expect(ctrl.activePages.length, initialPageCount + 1);
+      expect(ctrl.activePage!.title, '线性代数讲义');
 
-      final pdfSheet = ctrl.activeElements.single;
-      expect(pdfSheet.kind, ElementKind.image);
-      expect(pdfSheet.locked, isTrue);
-      expect(pdfSheet.zIndex, -100);
+      final sheets = List<CanvasElementModel>.from(ctrl.activeElements)
+        ..sort((a, b) => a.y.compareTo(b.y));
+      expect(sheets.length, 2);
+      expect(sheets[0].kind, ElementKind.image);
+      expect(sheets[1].kind, ElementKind.image);
+      expect(sheets[0].locked, isTrue);
+      expect(sheets[1].locked, isTrue);
+      expect(sheets[0].zIndex, lessThanOrEqualTo(-50));
+      expect(sheets[1].zIndex, lessThanOrEqualTo(-50));
+      expect(sheets[1].y, greaterThan(sheets[0].y + sheets[0].height));
+      expect(sheets[0].text, '线性代数讲义 · P1');
+      expect(sheets[1].text, '线性代数讲义 · P2');
 
-      // 2. Annotate on top of PDF page and verify eraser NEVER deletes locked PDF sheet
+      final pdfSheet1 = sheets[0];
+      final pdfSheet2 = sheets[1];
+
+      // 2. Annotate across P1 & P2 on that SAME canvas page and verify eraser NEVER deletes locked PDF sheets
       ctrl.startLocalStroke(const Offset(200, 220));
       ctrl.appendLocalStrokePoint(const Offset(260, 225));
       ctrl.finishLocalStroke();
       ctrl.createStickyNote(
-        sceneCenter: const Offset(360, 320),
+        sceneCenter: Offset(360, pdfSheet2.y + 180),
         initialText: '特征值与特征向量核心定理',
       );
       ctrl.setEditingCard(null);
       await tester.pumpAndSettle();
-      expect(ctrl.activeElements.length, 3);
+      expect(ctrl.activeElements.length, 4);
 
-      // Erase directly over the PDF sheet background & over the handwritten stroke
-      ctrl.eraseAt(const Offset(100, 100)); // hits only locked PDF sheet -> ignored
-      expect(ctrl.doc.getElement(pdfSheet.id)!.deleted, isFalse);
+      // Erase directly over PDF sheet backgrounds & over the handwritten stroke
+      ctrl.eraseAt(const Offset(100, 100)); // hits only locked PDF sheet P1 -> ignored
+      ctrl.eraseAt(Offset(100, pdfSheet2.y + 80)); // hits only locked PDF sheet P2 -> ignored
+      expect(ctrl.doc.getElement(pdfSheet1.id)!.deleted, isFalse);
+      expect(ctrl.doc.getElement(pdfSheet2.id)!.deleted, isFalse);
 
       ctrl.eraseAt(const Offset(230, 222)); // erases handwritten stroke on top
-      expect(ctrl.activeElements.length, 2);
-      expect(ctrl.doc.getElement(pdfSheet.id)!.deleted, isFalse);
+      expect(ctrl.activeElements.length, 3);
+      expect(ctrl.doc.getElement(pdfSheet1.id)!.deleted, isFalse);
+      expect(ctrl.doc.getElement(pdfSheet2.id)!.deleted, isFalse);
 
-      // 3. Bookmark active PDF page, switch templates cleanly, and run full-text search
+      // 3. Bookmark active continuous PDF page, test currentPage placement, and run full-text search
       ctrl.togglePageBookmark(ctrl.activePageId);
       expect(ctrl.activePage!.bookmarked, isTrue);
-      ctrl.updatePageBackground(
-        ctrl.activePageId,
-        background: PageBackground.weeklyPlan,
-        paperColor: const Color(0xFF1E293B),
-      );
-      await tester.pumpAndSettle();
-
-      ctrl.goToNextPage();
-      expect(ctrl.activePage!.title, '线性代数讲义 · P2');
 
       final hits = ctrl.searchWorkspaceContent('特征向量');
       expect(hits, isNotEmpty);
       ctrl.focusOnElement(hits.first.pageId, hits.first.elementId);
-      expect(ctrl.activePage!.title, '线性代数讲义 · P1');
+      expect(ctrl.activePage!.title, '线性代数讲义');
 
-      // 4. Export full notebook Markdown & current page PNG
+      // Embed another PDF directly into current canvas page below existing sheets
+      await ctrl.importPdfDocument(
+        const PdfImportedDocument(
+          fileName: '补充习题.pdf',
+          totalPages: 1,
+          pages: <PdfRenderedPage>[
+            PdfRenderedPage(
+              pageNumber: 1,
+              width: 595,
+              height: 842,
+              dataUrl: _FakeAndroidPlatformAdapter._tinyPngDataUrl,
+            ),
+          ],
+        ),
+        placement: PdfImportPlacement.currentPage,
+      );
+      expect(ctrl.activePages.length, initialPageCount + 1);
+      final appendedSheet = ctrl.activeElements
+          .where((e) => e.kind == ElementKind.image)
+          .reduce((a, b) => a.y > b.y ? a : b);
+      expect(appendedSheet.text, '补充习题 · P1');
+      expect(appendedSheet.y, greaterThan(pdfSheet2.y + pdfSheet2.height));
+
+      // 4. Export full notebook Markdown & tall continuous PNG
       final mdPath = await ctrl.saveActiveNotebookMarkdown();
       expect(mdPath, isNotNull);
-      expect(adapter.lastExportedText, contains('线性代数讲义 · P1 ⭐'));
+      expect(adapter.lastExportedText, contains('线性代数讲义 ⭐'));
+      expect(adapter.lastExportedText, contains('PDF 讲义连续底图'));
+      expect(adapter.lastExportedText, contains('共 3 页'));
       expect(adapter.lastExportedText, contains('特征值与特征向量核心定理'));
 
       // Note: ui.Picture.toImage in headless widget tests requires tester.runAsync
@@ -916,6 +947,182 @@ void main() {
       await tester.pumpAndSettle();
       expect(ctrl.toolbarDock, ToolbarDock.bottom);
       expect(ctrl.toolbarIsVertical, isFalse);
+    },
+  );
+
+  testWidgets(
+    'MindFlow same-canvas tokens, branch spawning, directed connectors, cluster drag, auto-layout, cascade delete, and AI JSON import/export coexist with PDF & ink',
+    (WidgetTester tester) async {
+      final adapter = _FakeAndroidPlatformAdapter();
+      addTearDown(adapter.dispose);
+
+      final ctrl = NotebookController(
+        platformAdapter: adapter,
+        initialPeerId: 'mindflow-peer',
+        initialDisplayName: 'MindFlow Tester',
+        initialFormFactor: DeviceFormFactor.desktop,
+        autoConnect: false,
+      );
+      addTearDown(ctrl.dispose);
+
+      await tester.binding.setSurfaceSize(const Size(1440, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      await tester.pumpWidget(SyncCanvasApp(controller: ctrl));
+      await tester.pumpAndSettle();
+
+      // 1. Import continuous 2-page PDF via toolbar dialog onto one canvas page
+      await tester.tap(find.byTooltip('导入 PDF 讲义'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('选择 PDF 并导入'));
+      await tester.pumpAndSettle();
+
+      // 2. Select MindFlow token tool from toolbar and create root token on canvas
+      final tokenToolBtn = find.byTooltip('概念词块 (N)');
+      expect(tokenToolBtn, findsOneWidget);
+      await tester.tap(tokenToolBtn);
+      await tester.pumpAndSettle();
+      expect(ctrl.tool, CanvasTool.token);
+
+      final rootId = ctrl.createMindFlowToken(
+        sceneCenter: const Offset(980, 140),
+        initialText: '矩阵特征值',
+        color: MindFlowColor.yellow,
+        beginEditing: false,
+      );
+      await tester.pumpAndSettle();
+
+      // 3. Click inline branch button to spawn a connected child token
+      final branchFinder = find.byKey(ValueKey<String>('spawn-branch-$rootId'));
+      expect(branchFinder, findsOneWidget);
+      await tester.tap(branchFinder);
+      await tester.pumpAndSettle();
+
+      final activeAfterBranch =
+          ctrl.activeElements.where((e) => !e.deleted).toList();
+      final tokens =
+          activeAfterBranch.where((e) => e.kind == ElementKind.token).toList();
+      final connectors = activeAfterBranch
+          .where((e) => e.kind == ElementKind.connector)
+          .toList();
+      final sheets = activeAfterBranch
+          .where((e) => e.kind == ElementKind.image && e.locked)
+          .toList();
+      expect(sheets.length, 2);
+      expect(tokens.length, 2);
+      expect(connectors.length, 1);
+      expect(connectors.first.sourceId, rootId);
+      final childToken = tokens.firstWhere((t) => t.id != rootId);
+      expect(connectors.first.targetId, childToken.id);
+
+      // Exit text editing before checking cluster & AI actions
+      ctrl.setEditingCard(null);
+      await tester.pumpAndSettle();
+
+      // 4. Multi-select both tokens & group them into a dashed cluster
+      final lassoPoly = <Offset>[
+        Offset(tokens[0].x - 40, tokens[0].y - 40),
+        Offset(tokens[1].x + tokens[1].width + 40, tokens[0].y - 40),
+        Offset(
+          tokens[1].x + tokens[1].width + 40,
+          tokens[1].y + tokens[1].height + 40,
+        ),
+        Offset(tokens[0].x - 40, tokens[1].y + tokens[1].height + 40),
+      ];
+      ctrl.startLasso(lassoPoly.first);
+      for (final p in lassoPoly.skip(1)) {
+        ctrl.appendLassoPoint(p);
+      }
+      ctrl.finishLasso();
+      await tester.pumpAndSettle();
+      expect(ctrl.selectedElementIds, containsAll(<String>[rootId, childToken.id]));
+
+      final clusterId = ctrl.groupSelectionIntoCluster(title: '核心架构');
+      expect(clusterId, isNotNull);
+      await tester.pumpAndSettle();
+
+      final clusterEl = ctrl.doc.getElement(clusterId!)!;
+      final spatialMembers = computeSpatialMemberIds(clusterEl, tokens);
+      expect(spatialMembers, containsAll(<String>[rootId, childToken.id]));
+
+      // Drag cluster header via cluster origins -> spatial members follow!
+      final rootXBefore = ctrl.doc.getElement(rootId)!.x;
+      final origins = ctrl.captureClusterDragOrigins(clusterId);
+      expect(origins.keys, containsAll(<String>[clusterId, rootId, childToken.id]));
+      ctrl.previewMoveSelectedElements(origins, const Offset(40, 25));
+      ctrl.commitGroupMoveUndo(origins);
+      await tester.pumpAndSettle();
+      expect(ctrl.doc.getElement(rootId)!.x, closeTo(rootXBefore + 40, 0.5));
+
+      // 5. Auto-layout avoids locked PDF sheets (starts at x >= 920)
+      final movedCount = ctrl.autoLayoutActivePageMindFlow();
+      expect(movedCount, greaterThanOrEqualTo(1));
+      expect(ctrl.doc.getElement(rootId)!.x, greaterThanOrEqualTo(920.0));
+      expect(
+        ctrl.doc.getElement(childToken.id)!.x,
+        greaterThan(ctrl.doc.getElement(rootId)!.x),
+      );
+
+      // 6. Export canonical MindFlow JSON + SVG, then import AI JSON via dialog
+      final boardJsonStr = ctrl.exportActivePageMindFlowBoardJson();
+      final decodedBoard = jsonDecode(boardJsonStr) as Map<String, dynamic>;
+      expect(decodedBoard['format'], 'mindflow');
+      expect(decodedBoard['schemaVersion'], 1);
+      expect((decodedBoard['tokens'] as List).length, 2);
+      expect((decodedBoard['edges'] as List).length, 1);
+      expect((decodedBoard['clusters'] as List).length, 1);
+      expect(ctrl.exportActivePageMindFlowSvg(), contains('<svg'));
+
+      await tester.tap(find.byTooltip('MindFlow AI 协同与 MCP'));
+      await tester.pumpAndSettle();
+      expect(find.text('MindFlow × SyncCanvas AI 协同中心'), findsOneWidget);
+
+      await tester.enterText(
+        find.byType(TextField).last,
+        '''```json
+{
+  "title": "AI 生成扩展",
+  "tokens": [
+    { "id": "ai_node_1", "color": "green", "text": "特征分解应用", "x": 100, "y": 420 }
+  ],
+  "edges": []
+}
+```''',
+      );
+      final importBtn = find.byKey(const ValueKey<String>('import-mindflow-json-btn'));
+      await tester.ensureVisible(importBtn);
+      await tester.pumpAndSettle();
+      await tester.tap(importBtn);
+      await tester.pumpAndSettle();
+
+      final importedAiNode = ctrl.doc.getElement('ai_node_1');
+      expect(importedAiNode, isNotNull);
+      expect(importedAiNode!.kind, ElementKind.token);
+      expect(importedAiNode.x, greaterThanOrEqualTo(920.0));
+
+      // Close MindFlow dialog
+      await tester.tap(find.byIcon(Icons.close_rounded).last);
+      await tester.pumpAndSettle();
+
+      // 7. Deleting a connected token cascades to incident connectors & undo restores both
+      ctrl.deleteElement(rootId);
+      await tester.pumpAndSettle();
+      expect(ctrl.doc.getElement(rootId)!.deleted, isTrue);
+      expect(ctrl.doc.getElement(connectors.first.id)!.deleted, isTrue);
+
+      ctrl.undo();
+      await tester.pumpAndSettle();
+      expect(ctrl.doc.getElement(rootId)!.deleted, isFalse);
+      expect(ctrl.doc.getElement(connectors.first.id)!.deleted, isFalse);
+
+      // Verify PNG & Markdown export work cleanly with MindFlow + PDF on page
+      final md = ctrl.exportActiveNotebookMarkdown();
+      expect(md, contains('矩阵特征值'));
+      final png = await tester.runAsync(
+        () => ctrl.renderActivePagePngBytes(pixelRatio: 1.0),
+      );
+      expect(png, isNotNull);
+      expect(png!.isNotEmpty, isTrue);
     },
   );
 }

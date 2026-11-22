@@ -6,6 +6,7 @@ import '../canvas/board_stage.dart';
 import '../state/notebook_controller.dart';
 import 'canvas_toolbar.dart';
 import 'connect_qr_dialog.dart';
+import 'mindflow_ai_dialog.dart';
 import 'notebook_sidebar.dart';
 import 'peer_presence_bar.dart';
 
@@ -94,6 +95,19 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
       }
     }
 
+    if (isCmdOrCtrl && event.logicalKey == LogicalKeyboardKey.keyG) {
+      if (c.selectedElementIds.isNotEmpty || c.selectedElementId != null) {
+        c.groupSelectionIntoCluster();
+        return KeyEventResult.handled;
+      }
+    }
+
+    if (!isCmdOrCtrl && event.logicalKey == LogicalKeyboardKey.tab) {
+      if (c.spawnChildTokenFromSelected() != null) {
+        return KeyEventResult.handled;
+      }
+    }
+
     if (event.logicalKey == LogicalKeyboardKey.delete ||
         event.logicalKey == LogicalKeyboardKey.backspace) {
       if (c.selectedElementIds.isNotEmpty) {
@@ -136,6 +150,15 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
         return KeyEventResult.handled;
       case LogicalKeyboardKey.keyE:
         c.setTool(CanvasTool.eraser);
+        return KeyEventResult.handled;
+      case LogicalKeyboardKey.keyN:
+        c.setTool(CanvasTool.token);
+        return KeyEventResult.handled;
+      case LogicalKeyboardKey.keyC:
+        c.setTool(CanvasTool.connector);
+        return KeyEventResult.handled;
+      case LogicalKeyboardKey.keyB:
+        c.setTool(CanvasTool.cluster);
         return KeyEventResult.handled;
       case LogicalKeyboardKey.keyR:
         c.setTool(CanvasTool.rectangle);
@@ -264,6 +287,24 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
     );
   }
 
+  Future<void> _exportCurrentPageSvg() async {
+    final saved = await widget.controller.saveActivePageSvg();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 82),
+        content: Text(
+          saved == null
+              ? '导出 SVG 失败'
+              : (saved == 'browser-download'
+                  ? '已触发当前页矢量导图 (.svg) 下载'
+                  : '已导出矢量导图 SVG：$saved'),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Focus(
@@ -333,6 +374,12 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
                                             context,
                                             c,
                                             scenePos: scenePos,
+                                          ),
+                                          onRequestEditGraphLabel: (el) =>
+                                              showEditGraphLabelDialog(
+                                            context,
+                                            c,
+                                            el,
                                           ),
                                         ),
                                       ),
@@ -423,6 +470,8 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
                                               showInsertImageDialog(context, c),
                                           onImportPdf: () =>
                                               showImportPdfDialog(context, c),
+                                          onOpenMindFlowAi: () =>
+                                              showMindFlowAiDialog(context, c),
                                         ),
                                       ),
 
@@ -741,6 +790,23 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
             onSelected: (value) {
               if (value == 'import_pdf') {
                 showImportPdfDialog(context, c);
+              } else if (value == 'mindflow_ai') {
+                showMindFlowAiDialog(context, c);
+              } else if (value == 'mindflow_layout') {
+                final moved = c.autoLayoutActivePageMindFlow();
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    behavior: SnackBarBehavior.floating,
+                    margin: const EdgeInsets.fromLTRB(16, 0, 16, 82),
+                    content: Text(
+                      moved > 0
+                          ? '已按拓扑层级自动整理 $moved 个 MindFlow 词块'
+                          : '当前页暂无可整理排布的词块节点',
+                    ),
+                  ),
+                );
+              } else if (value == 'export_mindflow_svg') {
+                _exportCurrentPageSvg();
               } else if (value == 'export_png') {
                 _exportCurrentPagePng();
               } else if (value == 'export_md') {
@@ -775,6 +841,45 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
                     ],
                   ),
                 ),
+              const PopupMenuItem<String>(
+                value: 'mindflow_ai',
+                child: Row(
+                  children: <Widget>[
+                    Icon(
+                      Icons.auto_awesome_outlined,
+                      size: 18,
+                      color: Color(0xFF4F46E5),
+                    ),
+                    SizedBox(width: 8),
+                    Text('MindFlow AI 协同与 MCP'),
+                  ],
+                ),
+              ),
+              const PopupMenuItem<String>(
+                value: 'mindflow_layout',
+                child: Row(
+                  children: <Widget>[
+                    Icon(
+                      Icons.account_tree_outlined,
+                      size: 18,
+                      color: Color(0xFF0F766E),
+                    ),
+                    SizedBox(width: 8),
+                    Text('自动整理 MindFlow 词块布局'),
+                  ],
+                ),
+              ),
+              const PopupMenuItem<String>(
+                value: 'export_mindflow_svg',
+                child: Row(
+                  children: <Widget>[
+                    Icon(Icons.polyline_outlined, size: 18),
+                    SizedBox(width: 8),
+                    Text('导出 MindFlow 矢量图 (.svg)'),
+                  ],
+                ),
+              ),
+              const PopupMenuDivider(),
               const PopupMenuItem<String>(
                 value: 'export_png',
                 child: Row(

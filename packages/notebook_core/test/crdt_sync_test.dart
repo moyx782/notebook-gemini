@@ -329,4 +329,182 @@ void main() {
       expect(decoded.lastSeenMs, 777);
     });
   });
+
+  group('MindFlow graph model, context export, cascade delete & auto-layout', () {
+    test('exports canonical MindFlow v1, context selection with endpoints, cascades token delete & exports SVG', () {
+      final doc = CrdtDocument(nodeId: 'mf-test');
+      seedStarterWorkspace(doc);
+
+      final res = applyMindFlowOperationsToPage(
+        doc,
+        'page-freeform',
+        <Map<String, dynamic>>[
+          <String, dynamic>{
+            'action': 'upsert',
+            'collection': 'tokens',
+            'item': <String, dynamic>{
+              'id': 'tk_root',
+              'text': '核心议题',
+              'x': 120,
+              'y': 160,
+              'color': 'yellow',
+            },
+          },
+          <String, dynamic>{
+            'action': 'upsert',
+            'collection': 'tokens',
+            'item': <String, dynamic>{
+              'id': 'tk_child',
+              'text': '方案落地',
+              'x': 380,
+              'y': 160,
+              'color': 'green',
+            },
+          },
+          <String, dynamic>{
+            'action': 'upsert',
+            'collection': 'edges',
+            'item': <String, dynamic>{
+              'id': 'ed_1',
+              'source': 'tk_root',
+              'target': 'tk_child',
+              'label': '拆解',
+            },
+          },
+          <String, dynamic>{
+            'action': 'upsert',
+            'collection': 'clusters',
+            'item': <String, dynamic>{
+              'id': 'cl_1',
+              'title': '核心区域',
+              'x': 80,
+              'y': 100,
+              'width': 520,
+              'height': 180,
+              'color': 'blue',
+            },
+          },
+        ],
+      );
+      expect(res.ops.length, 4);
+
+      final elements = doc.elementsForPage('page-freeform');
+      final byId = <String, CanvasElementModel>{
+        for (final e in elements) e.id: e,
+      };
+      final edgeEl = byId['ed_1']!;
+      final curve = computeConnectorCurve(edgeEl, byId);
+      expect(curve, isNotNull);
+      expect(hitTestConnectorCurve(curve!, curve.midX, curve.midY), isTrue);
+
+      // Hollow cluster center should NOT swallow clicks, border/header should
+      final clusterEl = byId['cl_1']!;
+      expect(clusterEl.hitTest(120, 115), isTrue); // header
+      expect(clusterEl.hitTest(320, 210), isFalse); // hollow interior
+
+      // Empty selection returns empty context
+      final emptyCtx = exportPageAsMindFlowContext(
+        doc,
+        'page-freeform',
+        revision: 1,
+        scope: 'selected',
+        selectedIds: const <String>{},
+      );
+      expect(emptyCtx['empty'], isTrue);
+
+      // Selecting ONLY the edge automatically includes both endpoints + spatial members inside cl_1
+      final edgeCtx = exportPageAsMindFlowContext(
+        doc,
+        'page-freeform',
+        revision: 1,
+        scope: 'selected',
+        selectedIds: const <String>{'ed_1', 'cl_1'},
+      );
+      expect(edgeCtx['empty'], isFalse);
+      final ctxTokens = edgeCtx['tokens'] as List<dynamic>;
+      expect(ctxTokens.length, 2);
+      final ctxClusters = edgeCtx['clusters'] as List<dynamic>;
+      expect(
+        (ctxClusters.first as Map)['spatialMemberIds'],
+        containsAll(<String>['tk_root', 'tk_child']),
+      );
+
+      // SVG vector export & auto-layout
+      final svg = exportPageAsMindFlowSvg(doc, 'page-freeform');
+      expect(svg, contains('<svg'));
+      expect(svg, contains('核心议题'));
+      expect(svg, contains('拆解'));
+
+      final layout = computeMindFlowAutoLayout(
+        <CanvasElementModel>[byId['tk_root']!, byId['tk_child']!],
+        <CanvasElementModel>[edgeEl],
+      );
+      expect(
+        layout['tk_child']!.x - layout['tk_root']!.x,
+        greaterThanOrEqualTo(240),
+      );
+
+      // Deleting tk_child cascades to ed_1
+      applyMindFlowOperationsToPage(
+        doc,
+        'page-freeform',
+        <Map<String, dynamic>>[
+          <String, dynamic>{
+            'action': 'delete',
+            'collection': 'tokens',
+            'id': 'tk_child',
+          },
+        ],
+      );
+      expect(doc.getElement('tk_child')!.deleted, isTrue);
+      expect(doc.getElement('ed_1')!.deleted, isTrue);
+    });
+
+    test('imports minimal AI MindFlow JSON cleanly onto another page with offset', () {
+      final doc = CrdtDocument(nodeId: 'mf-import');
+      seedStarterWorkspace(doc);
+
+      final result = importMindFlowJsonToPage(
+        doc,
+        <String, dynamic>{
+          'title': 'AI 脑暴结果',
+          'tokens': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'id': 'ai_root',
+              'text': '主线目标',
+              'x': 0,
+              'y': 0,
+              'color': 'yellow',
+            },
+            <String, dynamic>{
+              'id': 'ai_sub',
+              'text': '关键风险',
+              'x': 260,
+              'y': 0,
+              'color': 'red',
+            },
+          ],
+          'edges': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'id': 'ai_ed',
+              'source': 'ai_root',
+              'target': 'ai_sub',
+              'label': '潜在阻塞',
+            },
+          ],
+          'clusters': <Map<String, dynamic>>[],
+          'drawings': <Map<String, dynamic>>[],
+        },
+        pageId: 'page-cornell',
+        offsetX: 920.0,
+        offsetY: 40.0,
+      );
+
+      expect(result.touchedIds.length, 3);
+      expect(doc.getElement('ai_root')!.x, 920.0);
+      expect(doc.getElement('ai_root')!.semanticColor, MindFlowColor.yellow);
+      expect(doc.getElement('ai_sub')!.semanticColor, MindFlowColor.red);
+      expect(doc.getElement('ai_ed')!.sourceId, 'ai_root');
+    });
+  });
 }
