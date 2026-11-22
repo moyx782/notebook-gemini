@@ -314,117 +314,128 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
                                 ),
                               ),
                             Expanded(
-                              child: Stack(
-                                children: <Widget>[
-                                  Positioned.fill(
-                                    child: BoardStage(
-                                      controller: c,
-                                      isSpacePanPressed: _spacePressed,
-                                      onRequestInsertImageAt: (scenePos) =>
-                                          showInsertImageDialog(
-                                        context,
-                                        c,
-                                        scenePos: scenePos,
-                                      ),
-                                    ),
-                                  ),
-
-                                  // Follow peer banner
-                                  if (c.followingPeerId != null)
-                                    Positioned(
-                                      top: 12,
-                                      left: 0,
-                                      right: 0,
-                                      child: Center(
-                                        child: Material(
-                                          elevation: 4,
-                                          borderRadius:
-                                              BorderRadius.circular(999),
-                                          color: const Color(0xFF312E81),
-                                          child: Padding(
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 14,
-                                              vertical: 6,
-                                            ),
-                                            child: Row(
-                                              mainAxisSize: MainAxisSize.min,
-                                              children: <Widget>[
-                                                const Icon(
-                                                  Icons.visibility_rounded,
-                                                  size: 15,
-                                                  color: Colors.white,
-                                                ),
-                                                const SizedBox(width: 6),
-                                                const Text(
-                                                  '正在实时跟随协作者视角',
-                                                  style: TextStyle(
-                                                    color: Colors.white,
-                                                    fontSize: 12,
-                                                    fontWeight: FontWeight.w600,
-                                                  ),
-                                                ),
-                                                const SizedBox(width: 8),
-                                                InkWell(
-                                                  onTap: () => c.toggleFollowPeer(
-                                                    c.followingPeerId!,
-                                                  ),
-                                                  child: const Text(
-                                                    '退出跟随',
-                                                    style: TextStyle(
-                                                      color: Color(0xFFA5B4FC),
-                                                      fontSize: 12,
-                                                      fontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
+                              child: LayoutBuilder(
+                                builder: (context, stageConstraints) {
+                                  final stageSize = stageConstraints.biggest;
+                                  final bottomActionPad =
+                                      (c.toolbarDock == ToolbarDock.bottom &&
+                                              !c.toolbarCollapsed)
+                                          ? (mode == _ShellMode.phone ? 68.0 : 78.0)
+                                          : (mode == _ShellMode.phone ? 14.0 : 20.0);
+                                  return Stack(
+                                    children: <Widget>[
+                                      Positioned.fill(
+                                        child: BoardStage(
+                                          controller: c,
+                                          isSpacePanPressed: _spacePressed,
+                                          onRequestInsertImageAt: (scenePos) =>
+                                              showInsertImageDialog(
+                                            context,
+                                            c,
+                                            scenePos: scenePos,
                                           ),
                                         ),
                                       ),
-                                    ),
 
-                                  // Floating Lasso Selection Action Bar
-                                  if (c.selectedElementIds.length > 1 ||
-                                      (c.tool == CanvasTool.lasso &&
-                                          c.selectedElementIds.isNotEmpty))
-                                    Positioned(
-                                      left: 12,
-                                      right: 12,
-                                      bottom: mode == _ShellMode.phone ? 68 : 78,
-                                      child: Center(
-                                        child: LassoSelectionActionBar(
+                                      // Follow peer banner
+                                      if (c.followingPeerId != null)
+                                        Positioned(
+                                          top: 12,
+                                          left: 0,
+                                          right: 0,
+                                          child: Center(
+                                            child: Material(
+                                              elevation: 4,
+                                              borderRadius:
+                                                  BorderRadius.circular(999),
+                                              color: const Color(0xFF312E81),
+                                              child: Padding(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                  horizontal: 14,
+                                                  vertical: 6,
+                                                ),
+                                                child: Row(
+                                                  mainAxisSize:
+                                                      MainAxisSize.min,
+                                                  children: <Widget>[
+                                                    const Icon(
+                                                      Icons.visibility_rounded,
+                                                      size: 15,
+                                                      color: Colors.white,
+                                                    ),
+                                                    const SizedBox(width: 6),
+                                                    const Text(
+                                                      '正在实时跟随协作者视角',
+                                                      style: TextStyle(
+                                                        color: Colors.white,
+                                                        fontSize: 12,
+                                                        fontWeight:
+                                                            FontWeight.w600,
+                                                      ),
+                                                    ),
+                                                    const SizedBox(width: 8),
+                                                    InkWell(
+                                                      onTap: () =>
+                                                          c.toggleFollowPeer(
+                                                        c.followingPeerId!,
+                                                      ),
+                                                      child: const Text(
+                                                        '退出跟随',
+                                                        style: TextStyle(
+                                                          color:
+                                                              Color(0xFFA5B4FC),
+                                                          fontSize: 12,
+                                                          fontWeight:
+                                                              FontWeight.w700,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+
+                                      // Floating Lasso Selection Action Bar
+                                      if (c.selectedElementIds.length > 1 ||
+                                          (c.tool == CanvasTool.lasso &&
+                                              c.selectedElementIds.isNotEmpty))
+                                        Positioned(
+                                          left: 12,
+                                          right: 12,
+                                          bottom: bottomActionPad,
+                                          child: Center(
+                                            child: LassoSelectionActionBar(
+                                              controller: c,
+                                            ),
+                                          ),
+                                        ),
+
+                                      // Draggable / edge-dockable toolbar (with top Undo/Redo when vertical)
+                                      Positioned.fill(
+                                        child: DraggableCanvasToolbar(
                                           controller: c,
+                                          stageSize: stageSize,
+                                          compact: mode == _ShellMode.phone,
+                                          onInsertImage: () =>
+                                              showInsertImageDialog(context, c),
+                                          onImportPdf: () =>
+                                              showImportPdfDialog(context, c),
                                         ),
                                       ),
-                                    ),
 
-                                  // Floating bottom toolbar
-                                  Positioned(
-                                    left: 10,
-                                    right: 10,
-                                    bottom: mode == _ShellMode.phone ? 10 : 16,
-                                    child: Center(
-                                      child: CanvasToolbar(
-                                        controller: c,
-                                        compact: mode == _ShellMode.phone,
-                                        onInsertImage: () =>
-                                            showInsertImageDialog(context, c),
-                                        onImportPdf: () =>
-                                            showImportPdfDialog(context, c),
-                                      ),
-                                    ),
-                                  ),
-
-                                  // Zoom control pill (Desktop & Tablet)
-                                  if (mode != _ShellMode.phone)
-                                    Positioned(
-                                      right: 16,
-                                      bottom: 18,
-                                      child: _ZoomPill(controller: c),
-                                    ),
-                                ],
+                                      // Zoom control pill (Desktop & Tablet)
+                                      if (mode != _ShellMode.phone)
+                                        Positioned(
+                                          right: 16,
+                                          bottom: 18,
+                                          child: _ZoomPill(controller: c),
+                                        ),
+                                    ],
+                                  );
+                                },
                               ),
                             ),
                           ],
@@ -742,6 +753,8 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
                 _confirmClearPage();
               } else if (value == 'reset_view') {
                 c.resetViewport();
+              } else if (value == 'reset_toolbar') {
+                c.resetToolbarPosition();
               } else if (value == 'stylus') {
                 c.setStylusOnlyMode(!c.stylusOnlyMode);
               }
@@ -830,6 +843,16 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
                     Icon(Icons.center_focus_strong_outlined, size: 18),
                     SizedBox(width: 8),
                     Text('重置画布视角 (100%)'),
+                  ],
+                ),
+              ),
+              const PopupMenuItem<String>(
+                value: 'reset_toolbar',
+                child: Row(
+                  children: <Widget>[
+                    Icon(Icons.dock_rounded, size: 18),
+                    SizedBox(width: 8),
+                    Text('重置工具栏位置'),
                   ],
                 ),
               ),

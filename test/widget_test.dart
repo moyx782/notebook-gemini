@@ -824,6 +824,100 @@ void main() {
       expect(adapter.lastExportedBytes!.sublist(0, 4), <int>[0x89, 0x50, 0x4E, 0x47]);
     },
   );
+
+  testWidgets(
+    'Toolbar drags across edges/floating, switches to vertical with Undo and Redo at top, and collapses to mini ball',
+    (WidgetTester tester) async {
+      final ctrl = NotebookController(
+        initialPeerId: 'toolbar-drag-peer',
+        initialDisplayName: 'Drag Tester',
+        initialFormFactor: DeviceFormFactor.desktop,
+        autoConnect: false,
+      );
+      addTearDown(ctrl.dispose);
+
+      await tester.binding.setSurfaceSize(const Size(1200, 820));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      await tester.pumpWidget(SyncCanvasApp(controller: ctrl));
+      await tester.pumpAndSettle();
+
+      expect(ctrl.toolbarDock, ToolbarDock.bottom);
+      expect(ctrl.toolbarIsVertical, isFalse);
+
+      // Drag handle to the left edge -> switches to vertical dock on left
+      final handleFinder = find.byKey(const ValueKey<String>('toolbar-drag-handle'));
+      await tester.drag(handleFinder, const Offset(-540, -240));
+      await tester.pumpAndSettle();
+
+      expect(ctrl.toolbarDock, ToolbarDock.left);
+      expect(ctrl.toolbarIsVertical, isTrue);
+      expect(
+        find.byKey(const ValueKey<String>('vertical-top-undo-redo')),
+        findsOneWidget,
+      );
+
+      // Verify Undo & Redo are pinned above drawing tools in vertical mode
+      final undoBtnFinder = find.byTooltip('撤销 (Ctrl/Cmd+Z)');
+      final redoBtnFinder = find.byTooltip('重做 (Ctrl/Cmd+Shift+Z)');
+      expect(undoBtnFinder, findsOneWidget);
+      expect(redoBtnFinder, findsOneWidget);
+
+      final undoTop = tester.getTopLeft(undoBtnFinder).dy;
+      final redoTop = tester.getTopLeft(redoBtnFinder).dy;
+      final selectTop = tester.getTopLeft(find.byTooltip('选择 / 移动 (V)')).dy;
+      final penTop = tester.getTopLeft(find.byTooltip('压感钢笔 (P)')).dy;
+      expect(undoTop, lessThan(selectTop));
+      expect(redoTop, lessThan(selectTop));
+      expect(undoTop, lessThan(penTop));
+
+      // Verify drawing + top-pinned Undo & Redo buttons work smoothly
+      final beforeCount = ctrl.activeElements.length;
+      final boardCenter = tester.getCenter(find.byType(BoardStage));
+      final gesture = await tester.startGesture(boardCenter + const Offset(80, -20));
+      await gesture.moveBy(const Offset(75, 35));
+      await gesture.up();
+      await tester.pumpAndSettle();
+      expect(ctrl.activeElements.length, beforeCount + 1);
+
+      await tester.tap(undoBtnFinder);
+      await tester.pumpAndSettle();
+      expect(ctrl.activeElements.length, beforeCount);
+
+      await tester.tap(redoBtnFinder);
+      await tester.pumpAndSettle();
+      expect(ctrl.activeElements.length, beforeCount + 1);
+
+      // Drag handle to center -> free floating (keeping vertical orientation)
+      await tester.drag(handleFinder, const Offset(360, 40));
+      await tester.pumpAndSettle();
+      expect(ctrl.toolbarDock, ToolbarDock.floating);
+      expect(ctrl.toolbarIsVertical, isTrue);
+      expect(
+        find.byKey(const ValueKey<String>('vertical-top-undo-redo')),
+        findsOneWidget,
+      );
+
+      // Collapse to mini floating ball & expand back
+      await tester.tap(find.byTooltip('收起为悬浮笔球'));
+      await tester.pumpAndSettle();
+      expect(ctrl.toolbarCollapsed, isTrue);
+      expect(
+        find.byKey(const ValueKey<String>('collapsed-toolbar-ball')),
+        findsOneWidget,
+      );
+
+      await tester.tap(find.byTooltip('展开画笔工具栏'));
+      await tester.pumpAndSettle();
+      expect(ctrl.toolbarCollapsed, isFalse);
+
+      // Reset position back to bottom horizontal
+      ctrl.resetToolbarPosition();
+      await tester.pumpAndSettle();
+      expect(ctrl.toolbarDock, ToolbarDock.bottom);
+      expect(ctrl.toolbarIsVertical, isFalse);
+    },
+  );
 }
 
 class _RealSocketHttpOverrides extends HttpOverrides {}

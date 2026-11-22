@@ -58,6 +58,17 @@ enum CanvasTool {
   }
 }
 
+enum ToolbarDock {
+  bottom('底部停靠'),
+  top('顶部停靠'),
+  left('左侧竖排'),
+  right('右侧竖排'),
+  floating('自由悬浮');
+
+  const ToolbarDock(this.label);
+  final String label;
+}
+
 enum SyncConnectionState {
   offline('离线缓存'),
   connecting('正在连接'),
@@ -294,6 +305,11 @@ class NotebookController extends ChangeNotifier {
   bool _sidebarOpen = true;
   bool _showPageGuide = true;
   bool _bookmarkFilterOnly = false;
+  ToolbarDock _toolbarDock = ToolbarDock.bottom;
+  bool _toolbarFloatingVertical = false;
+  bool _toolbarCollapsed = false;
+  double _toolbarFracX = 0.5;
+  double _toolbarFracY = 0.92;
   String _searchQuery = '';
   final List<PenPreset> _penPresets = <PenPreset>[
     const PenPreset(
@@ -384,6 +400,15 @@ class NotebookController extends ChangeNotifier {
   bool get sidebarOpen => _sidebarOpen;
   bool get showPageGuide => _showPageGuide;
   bool get bookmarkFilterOnly => _bookmarkFilterOnly;
+  ToolbarDock get toolbarDock => _toolbarDock;
+  bool get toolbarFloatingVertical => _toolbarFloatingVertical;
+  bool get toolbarIsVertical =>
+      _toolbarDock == ToolbarDock.left ||
+      _toolbarDock == ToolbarDock.right ||
+      (_toolbarDock == ToolbarDock.floating && _toolbarFloatingVertical);
+  bool get toolbarCollapsed => _toolbarCollapsed;
+  double get toolbarFracX => _toolbarFracX;
+  double get toolbarFracY => _toolbarFracY;
   String get searchQuery => _searchQuery;
   List<PenPreset> get penPresets => List<PenPreset>.unmodifiable(_penPresets);
   bool get isActiveStrokeSnappedLine => _isActiveStrokeSnappedLine;
@@ -543,6 +568,74 @@ class NotebookController extends ChangeNotifier {
 
   void togglePageGuide() {
     _showPageGuide = !_showPageGuide;
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  void updateToolbarPlacement({
+    required ToolbarDock dock,
+    double? fracX,
+    double? fracY,
+    bool? floatingVertical,
+    bool save = true,
+  }) {
+    _toolbarDock = dock;
+    if (fracX != null) {
+      _toolbarFracX = fracX.clamp(0.0, 1.0);
+    }
+    if (fracY != null) {
+      _toolbarFracY = fracY.clamp(0.0, 1.0);
+    }
+    if (dock == ToolbarDock.left || dock == ToolbarDock.right) {
+      _toolbarFloatingVertical = true;
+    } else if (dock == ToolbarDock.top || dock == ToolbarDock.bottom) {
+      _toolbarFloatingVertical = false;
+    } else if (floatingVertical != null) {
+      _toolbarFloatingVertical = floatingVertical;
+    }
+    if (save) {
+      _scheduleSave();
+    }
+    notifyListeners();
+  }
+
+  void toggleToolbarOrientation() {
+    if (toolbarIsVertical) {
+      if (_toolbarDock == ToolbarDock.floating) {
+        _toolbarFloatingVertical = false;
+      } else {
+        _toolbarDock = ToolbarDock.bottom;
+        _toolbarFracX = 0.5;
+        _toolbarFracY = 0.92;
+        _toolbarFloatingVertical = false;
+      }
+    } else {
+      if (_toolbarDock == ToolbarDock.floating) {
+        _toolbarFloatingVertical = true;
+      } else {
+        _toolbarDock = ToolbarDock.left;
+        _toolbarFracX = 0.02;
+        _toolbarFracY = 0.5;
+        _toolbarFloatingVertical = true;
+      }
+    }
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  void setToolbarCollapsed(bool collapsed) {
+    if (_toolbarCollapsed == collapsed) return;
+    _toolbarCollapsed = collapsed;
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  void resetToolbarPosition() {
+    _toolbarDock = ToolbarDock.bottom;
+    _toolbarFloatingVertical = false;
+    _toolbarCollapsed = false;
+    _toolbarFracX = 0.5;
+    _toolbarFracY = 0.92;
     _scheduleSave();
     notifyListeners();
   }
@@ -3424,6 +3517,29 @@ class NotebookController extends ChangeNotifier {
         if (savedGuide != null) {
           _showPageGuide = savedGuide;
         }
+        final savedDock = meta['toolbarDock'] as String?;
+        if (savedDock != null && savedDock.isNotEmpty) {
+          _toolbarDock = ToolbarDock.values.firstWhere(
+            (d) => d.name == savedDock,
+            orElse: () => ToolbarDock.bottom,
+          );
+        }
+        final savedFloatingVert = meta['toolbarFloatingVertical'] as bool?;
+        if (savedFloatingVert != null) {
+          _toolbarFloatingVertical = savedFloatingVert;
+        }
+        final savedCollapsed = meta['toolbarCollapsed'] as bool?;
+        if (savedCollapsed != null) {
+          _toolbarCollapsed = savedCollapsed;
+        }
+        final savedFracX = meta['toolbarFracX'] as num?;
+        if (savedFracX != null) {
+          _toolbarFracX = savedFracX.toDouble().clamp(0.0, 1.0);
+        }
+        final savedFracY = meta['toolbarFracY'] as num?;
+        if (savedFracY != null) {
+          _toolbarFracY = savedFracY.toDouble().clamp(0.0, 1.0);
+        }
         final savedPresets = meta['penPresets'] as List<dynamic>?;
         if (savedPresets != null && savedPresets.length == _penPresets.length) {
           for (var i = 0; i < _penPresets.length; i++) {
@@ -3482,6 +3598,11 @@ class NotebookController extends ChangeNotifier {
         'wsUrl': _wsUrl,
         'roomId': _roomId,
         'showPageGuide': _showPageGuide,
+        'toolbarDock': _toolbarDock.name,
+        'toolbarFloatingVertical': _toolbarFloatingVertical,
+        'toolbarCollapsed': _toolbarCollapsed,
+        'toolbarFracX': _toolbarFracX,
+        'toolbarFracY': _toolbarFracY,
         'penPresets': _penPresets.map((p) => p.toJson()).toList(),
       }),
     );
