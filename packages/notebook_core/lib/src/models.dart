@@ -5,7 +5,9 @@ enum PageBackground {
   grid('方格'),
   dots('点阵'),
   ruled('横线'),
-  cornell('康奈尔');
+  cornell('康奈尔'),
+  mistakeBook('错题本'),
+  weeklyPlan('日程待办');
 
   const PageBackground(this.label);
   final String label;
@@ -181,6 +183,7 @@ class NotebookPageModel {
     required this.sortOrder,
     required this.deleted,
     required this.updatedAtMs,
+    this.bookmarked = false,
   });
 
   final String id;
@@ -191,6 +194,7 @@ class NotebookPageModel {
   final int sortOrder;
   final bool deleted;
   final int updatedAtMs;
+  final bool bookmarked;
 }
 
 class CanvasElementModel {
@@ -214,6 +218,7 @@ class CanvasElementModel {
     required this.deleted,
     required this.updatedAtMs,
     this.fillColorValue = 0,
+    this.locked = false,
   });
 
   final String id;
@@ -235,6 +240,7 @@ class CanvasElementModel {
   final String authorName;
   final bool deleted;
   final int updatedAtMs;
+  final bool locked;
 
   ElementBounds get bounds {
     if (kind == ElementKind.stroke || kind == ElementKind.highlighter) {

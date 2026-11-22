@@ -17,7 +17,7 @@ Uint8List? _decodeDataUrlCached(String uri) {
   if (comma < 0) return null;
   try {
     final bytes = base64Decode(uri.substring(comma + 1));
-    if (_decodedImageCache.length > 32) {
+    if (_decodedImageCache.length > 64) {
       _decodedImageCache.remove(_decodedImageCache.keys.first);
     }
     _decodedImageCache[uri] = bytes;
@@ -73,6 +73,7 @@ class CanvasCardLayer extends StatelessWidget {
                   child: _CanvasElementCard(
                     element: el,
                     controller: controller,
+                    showUnlockBadge: interactive,
                   ),
                 ),
               ),
@@ -87,10 +88,12 @@ class _CanvasElementCard extends StatefulWidget {
   const _CanvasElementCard({
     required this.element,
     required this.controller,
+    this.showUnlockBadge = false,
   });
 
   final CanvasElementModel element;
   final NotebookController controller;
+  final bool showUnlockBadge;
 
   @override
   State<_CanvasElementCard> createState() => _CanvasElementCardState();
@@ -153,9 +156,89 @@ class _CanvasElementCardState extends State<_CanvasElementCard> {
     final el = widget.element;
     final isSticky = el.kind == ElementKind.stickyNote;
     final isImage = el.kind == ElementKind.image;
+    final isLockedPdfSheet = isImage && el.locked && el.text.trim().isEmpty;
     final bgColor = el.fillColorValue != 0
         ? Color(el.fillColorValue)
         : (isSticky ? const Color(0xFFFEF08A) : Colors.white);
+
+    if (el.locked) {
+      return Stack(
+        clipBehavior: Clip.none,
+        children: <Widget>[
+          IgnorePointer(
+            child: Container(
+              width: el.width,
+              height: el.height,
+              decoration: BoxDecoration(
+                color: bgColor,
+                borderRadius: BorderRadius.circular(
+                  isLockedPdfSheet ? 4 : (isSticky ? 6 : 14),
+                ),
+                border: Border.all(
+                  color: isLockedPdfSheet
+                      ? const Color(0xFFCBD5E1)
+                      : const Color(0xFFE2E8F0),
+                  width: 1.0,
+                ),
+                boxShadow: <BoxShadow>[
+                  BoxShadow(
+                    color: Colors.black.withValues(
+                      alpha: isLockedPdfSheet ? 0.08 : 0.05,
+                    ),
+                    blurRadius: isLockedPdfSheet ? 18 : 14,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(
+                  isLockedPdfSheet ? 3 : (isSticky ? 5 : 13),
+                ),
+                child: isImage
+                    ? _buildImageCardBody(el, fullBleed: isLockedPdfSheet)
+                    : _buildTextOrStickyBody(el, isSticky),
+              ),
+            ),
+          ),
+          if (widget.showUnlockBadge)
+            Positioned(
+              top: 8,
+              right: 8,
+              child: Material(
+                elevation: 2,
+                color: Colors.white.withValues(alpha: 0.92),
+                borderRadius: BorderRadius.circular(999),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(999),
+                  onTap: () => widget.controller.toggleElementLocked(el.id),
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Icon(
+                          Icons.lock_outline_rounded,
+                          size: 13,
+                          color: Color(0xFF475569),
+                        ),
+                        SizedBox(width: 4),
+                        Text(
+                          '底图已锁 · 点击解锁',
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xFF475569),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      );
+    }
 
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
@@ -317,6 +400,23 @@ class _CanvasElementCardState extends State<_CanvasElementCard> {
                             ),
                           ),
                       const SizedBox(width: 4),
+                      Tooltip(
+                        message: '锁定为底图（防橡皮擦与误拖动）',
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: () =>
+                              widget.controller.toggleElementLocked(el.id),
+                          child: const Padding(
+                            padding: EdgeInsets.all(3),
+                            child: Icon(
+                              Icons.lock_open_rounded,
+                              size: 15,
+                              color: Color(0xFF475569),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 2),
                       InkWell(
                         borderRadius: BorderRadius.circular(12),
                         onTap: () => widget.controller.deleteElement(el.id),
@@ -476,7 +576,7 @@ class _CanvasElementCardState extends State<_CanvasElementCard> {
     );
   }
 
-  Widget _buildImageCardBody(CanvasElementModel el) {
+  Widget _buildImageCardBody(CanvasElementModel el, {bool fullBleed = false}) {
     final uri = el.imageUri.trim();
     Widget content;
     if (uri.startsWith('preset://')) {
@@ -484,7 +584,11 @@ class _CanvasElementCardState extends State<_CanvasElementCard> {
     } else if (uri.startsWith('data:image/')) {
       final bytes = _decodeDataUrlCached(uri);
       if (bytes != null) {
-        content = Image.memory(bytes, fit: BoxFit.contain);
+        content = Image.memory(
+          bytes,
+          fit: BoxFit.contain,
+          filterQuality: FilterQuality.medium,
+        );
       } else {
         content = _brokenImagePlaceholder('图片编码解析失败');
       }
@@ -497,6 +601,13 @@ class _CanvasElementCardState extends State<_CanvasElementCard> {
       );
     } else {
       content = _brokenImagePlaceholder('未识别的图片地址');
+    }
+
+    if (fullBleed) {
+      return ColoredBox(
+        color: Colors.white,
+        child: content,
+      );
     }
 
     return Column(

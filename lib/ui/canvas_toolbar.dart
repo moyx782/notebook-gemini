@@ -165,17 +165,345 @@ Future<void> showInsertImageDialog(
   titleCtrl.dispose();
 }
 
+Future<void> showImportPdfDialog(
+  BuildContext context,
+  NotebookController controller,
+) async {
+  var asNewNotebook = false;
+  var maxPages = 30;
+  var isImporting = false;
+  String? errorMsg;
+
+  await showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setStateDialog) {
+        return AlertDialog(
+          title: const Row(
+            children: <Widget>[
+              Icon(
+                Icons.picture_as_pdf_rounded,
+                color: Color(0xFFDC2626),
+                size: 22,
+              ),
+              SizedBox(width: 8),
+              Flexible(child: Text('导入 PDF 讲义 / 文档')),
+            ],
+          ),
+          content: SizedBox(
+            width: 420,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const Text(
+                    '将 PDF 每一页高清渲染为独立画板页，并自动锁定为防误擦底图，支持触控笔书写、荧光笔划重点与多端实时同步批注。',
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      height: 1.45,
+                      color: Color(0xFF475569),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  const Text(
+                    '导入位置',
+                    style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: <Widget>[
+                      ChoiceChip(
+                        label: const Text('追加到当前笔记本'),
+                        selected: !asNewNotebook,
+                        onSelected: isImporting
+                            ? null
+                            : (_) => setStateDialog(() => asNewNotebook = false),
+                      ),
+                      ChoiceChip(
+                        label: const Text('新建独立讲义笔记本'),
+                        selected: asNewNotebook,
+                        onSelected: isImporting
+                            ? null
+                            : (_) => setStateDialog(() => asNewNotebook = true),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  const Text(
+                    '单次最大导入页数',
+                    style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: <Widget>[
+                      for (final count in const <int>[15, 30, 60])
+                        ChoiceChip(
+                          label: Text('前 $count 页'),
+                          selected: maxPages == count,
+                          onSelected: isImporting
+                              ? null
+                              : (_) => setStateDialog(() => maxPages = count),
+                        ),
+                    ],
+                  ),
+                  if (isImporting) ...<Widget>[
+                    const SizedBox(height: 18),
+                    const Row(
+                      children: <Widget>[
+                        SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2.2),
+                        ),
+                        SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            '正在解析并高清渲染 PDF 页面，请稍候...',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              color: Color(0xFF4F46E5),
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                  if (errorMsg != null) ...<Widget>[
+                    const SizedBox(height: 12),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFEF2F2),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: const Color(0xFFFECACA)),
+                      ),
+                      child: Text(
+                        errorMsg!,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Color(0xFFB91C1C),
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: isImporting ? null : () => Navigator.of(ctx).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton.icon(
+              onPressed: isImporting
+                  ? null
+                  : () async {
+                      setStateDialog(() {
+                        isImporting = true;
+                        errorMsg = null;
+                      });
+                      final doc = await controller.platform
+                          .pickAndRenderPdf(maxPages: maxPages);
+                      if (!ctx.mounted) return;
+                      if (doc == null) {
+                        setStateDialog(() => isImporting = false);
+                        return;
+                      }
+                      if (doc.error != null && doc.error!.isNotEmpty) {
+                        setStateDialog(() {
+                          isImporting = false;
+                          errorMsg = doc.error;
+                        });
+                        return;
+                      }
+                      if (doc.pages.isEmpty) {
+                        setStateDialog(() {
+                          isImporting = false;
+                          errorMsg = '未能在该 PDF 中读取到可渲染的页面';
+                        });
+                        return;
+                      }
+                      final importedCount = await controller.importPdfDocument(
+                        doc,
+                        asNewNotebook: asNewNotebook,
+                      );
+                      if (!ctx.mounted) return;
+                      Navigator.of(ctx).pop();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          behavior: SnackBarBehavior.floating,
+                          margin: const EdgeInsets.fromLTRB(16, 0, 16, 82),
+                          content: Text(
+                            '已导入《${doc.fileName}》共 $importedCount 页（底图默认防误擦锁定，可直接手写批注）',
+                          ),
+                        ),
+                      );
+                    },
+              icon: const Icon(Icons.upload_file_rounded, size: 18),
+              label: const Text('选择 PDF 并导入'),
+            ),
+          ],
+        );
+      },
+    ),
+  );
+}
+
+class LassoSelectionActionBar extends StatelessWidget {
+  const LassoSelectionActionBar({
+    super.key,
+    required this.controller,
+  });
+
+  final NotebookController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final count = controller.selectedElementIds.length;
+    if (count == 0) return const SizedBox.shrink();
+
+    return Material(
+      elevation: 6,
+      shadowColor: Colors.black.withValues(alpha: 0.14),
+      borderRadius: BorderRadius.circular(999),
+      color: Colors.white.withValues(alpha: 0.97),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: const Color(0xFFC7D2FE)),
+        ),
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              const Icon(
+                Icons.gesture_rounded,
+                size: 16,
+                color: Color(0xFF4F46E5),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                '已选 $count 项',
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: Color(0xFF312E81),
+                ),
+              ),
+              const SizedBox(width: 8),
+              for (final color in NotebookController.inkPalette.take(5))
+                GestureDetector(
+                  onTap: () => controller.recolorSelectedElements(color),
+                  child: Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 2.5),
+                    width: 16,
+                    height: 16,
+                    decoration: BoxDecoration(
+                      color: color,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.white, width: 1.4),
+                      boxShadow: <BoxShadow>[
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.15),
+                          blurRadius: 2,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              const SizedBox(width: 6),
+              Container(width: 1, height: 18, color: const Color(0xFFE2E8F0)),
+              const SizedBox(width: 4),
+              InkWell(
+                borderRadius: BorderRadius.circular(999),
+                onTap: () => controller.duplicateSelectedElements(),
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  child: Row(
+                    children: <Widget>[
+                      Icon(Icons.copy_rounded, size: 14, color: Color(0xFF334155)),
+                      SizedBox(width: 4),
+                      Text(
+                        '复制',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF334155),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                borderRadius: BorderRadius.circular(999),
+                onTap: controller.deleteSelectedElements,
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  child: Row(
+                    children: <Widget>[
+                      Icon(
+                        Icons.delete_outline_rounded,
+                        size: 15,
+                        color: Color(0xFFDC2626),
+                      ),
+                      SizedBox(width: 3),
+                      Text(
+                        '删除',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFFDC2626),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                borderRadius: BorderRadius.circular(999),
+                onTap: controller.clearSelection,
+                child: const Padding(
+                  padding: EdgeInsets.all(4),
+                  child: Icon(
+                    Icons.close_rounded,
+                    size: 15,
+                    color: Color(0xFF64748B),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class CanvasToolbar extends StatelessWidget {
   const CanvasToolbar({
     super.key,
     required this.controller,
     required this.compact,
     required this.onInsertImage,
+    this.onImportPdf,
   });
 
   final NotebookController controller;
   final bool compact;
   final VoidCallback onInsertImage;
+  final VoidCallback? onImportPdf;
 
   @override
   Widget build(BuildContext context) {
@@ -207,6 +535,12 @@ class CanvasToolbar extends StatelessWidget {
                 tooltip: '选择 / 移动 (V)',
                 selected: c.tool == CanvasTool.select,
                 onTap: () => c.setTool(CanvasTool.select),
+              ),
+              _ToolBtn(
+                icon: Icons.gesture_rounded,
+                tooltip: '套索框选 (G)',
+                selected: c.tool == CanvasTool.lasso,
+                onTap: () => c.setTool(CanvasTool.lasso),
               ),
               _ToolBtn(
                 icon: Icons.edit_outlined,
@@ -245,6 +579,13 @@ class CanvasToolbar extends StatelessWidget {
                 selected: c.tool == CanvasTool.image,
                 onTap: onInsertImage,
               ),
+              if (c.platform.canImportPdf && onImportPdf != null)
+                _ToolBtn(
+                  icon: Icons.picture_as_pdf_outlined,
+                  tooltip: '导入 PDF 讲义',
+                  selected: false,
+                  onTap: onImportPdf,
+                ),
               _ToolBtn(
                 icon: Icons.flare_rounded,
                 tooltip: '协作激光笔 (L)',
@@ -260,7 +601,31 @@ class CanvasToolbar extends StatelessWidget {
 
               const SizedBox(width: 6),
               Container(width: 1, height: 24, color: const Color(0xFFE2E8F0)),
-              const SizedBox(width: 8),
+              const SizedBox(width: 6),
+
+              // 3 one-tap favorite pen/highlighter presets
+              if (!compact) ...<Widget>[
+                for (var idx = 0; idx < c.penPresets.length; idx++)
+                  _PenPresetSlotBtn(
+                    preset: c.penPresets[idx],
+                    selected: c.activePenPresetIndex == idx,
+                    onTap: () => c.applyPenPreset(idx),
+                    onLongPress: () {
+                      c.saveCurrentToPenPreset(idx);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          duration: const Duration(milliseconds: 1200),
+                          behavior: SnackBarBehavior.floating,
+                          margin: const EdgeInsets.fromLTRB(16, 0, 16, 82),
+                          content: Text('已将当前笔触保存到预设槽 ${idx + 1}'),
+                        ),
+                      );
+                    },
+                  ),
+                const SizedBox(width: 4),
+                Container(width: 1, height: 24, color: const Color(0xFFE2E8F0)),
+                const SizedBox(width: 6),
+              ],
 
               // Color dots
               for (final color in NotebookController.inkPalette.take(
@@ -381,6 +746,69 @@ class CanvasToolbar extends StatelessWidget {
                   ),
                 ),
               ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PenPresetSlotBtn extends StatelessWidget {
+  const _PenPresetSlotBtn({
+    required this.preset,
+    required this.selected,
+    required this.onTap,
+    required this.onLongPress,
+  });
+
+  final PenPreset preset;
+  final bool selected;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Color(preset.colorValue);
+    return Tooltip(
+      message: '${preset.label}（点击切换 · 长按保存当前笔触）',
+      child: GestureDetector(
+        onTap: onTap,
+        onLongPress: onLongPress,
+        child: Container(
+          margin: const EdgeInsets.symmetric(horizontal: 2),
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+          decoration: BoxDecoration(
+            color: selected
+                ? color.withValues(alpha: 0.14)
+                : const Color(0xFFF8FAFC),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: selected ? color : const Color(0xFFE2E8F0),
+              width: selected ? 1.6 : 1.0,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Icon(
+                preset.isHighlighter
+                    ? Icons.brush_rounded
+                    : Icons.mode_edit_outline_rounded,
+                size: 14,
+                color: color,
+              ),
+              const SizedBox(width: 3),
+              Container(
+                width: 8,
+                height: (preset.width * 0.35).clamp(2.5, 8.0),
+                decoration: BoxDecoration(
+                  color: preset.isHighlighter
+                      ? color.withValues(alpha: 0.65)
+                      : color,
+                  borderRadius: BorderRadius.circular(99),
+                ),
+              ),
             ],
           ),
         ),

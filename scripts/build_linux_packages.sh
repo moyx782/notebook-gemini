@@ -66,7 +66,9 @@ for required_file in \
   "$BUNDLE_DIR/web/index.html" \
   "$BUNDLE_DIR/web/main.dart.js" \
   "$BUNDLE_DIR/web/flutter_bootstrap.js" \
-  "$BUNDLE_DIR/web/canvaskit/canvaskit.wasm"
+  "$BUNDLE_DIR/web/canvaskit/canvaskit.wasm" \
+  "$BUNDLE_DIR/web/pdfjs/pdf.min.mjs" \
+  "$BUNDLE_DIR/web/pdfjs/pdf.worker.min.mjs"
 do
   if [ ! -f "$required_file" ]; then
     echo "Required offline Web bundle file missing: $required_file" >&2
@@ -118,6 +120,7 @@ Architecture: $DEB_ARCH
 Installed-Size: $INSTALLED_SIZE
 Maintainer: SyncCanvas <noreply@github.com>
 Depends: libgtk-3-0 (>= 3.18) | libgtk-3-0t64, libglib2.0-0 (>= 2.50) | libglib2.0-0t64, libc6
+Recommends: poppler-utils, zenity
 Homepage: https://github.com/moyx782/notebook-gemini
 Description: SyncCanvas Notebook - cross-platform real-time shared whiteboard
  Multi-page handwriting and whiteboard notebook with HLC-CRDT real-time sync,

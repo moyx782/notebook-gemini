@@ -108,7 +108,9 @@ $webRequired = @(
   (Join-Path $StageWebDir 'index.html'),
   (Join-Path $StageWebDir 'main.dart.js'),
   (Join-Path $StageWebDir 'flutter_bootstrap.js'),
-  (Join-Path $StageWebDir 'canvaskit\canvaskit.wasm')
+  (Join-Path $StageWebDir 'canvaskit\canvaskit.wasm'),
+  (Join-Path $StageWebDir 'pdfjs\pdf.min.mjs'),
+  (Join-Path $StageWebDir 'pdfjs\pdf.worker.min.mjs')
 )
 foreach ($req in $webRequired) {
   if (-not (Test-Path $req)) {

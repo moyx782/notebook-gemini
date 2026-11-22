@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -20,12 +21,18 @@ class _FakeAndroidPlatformAdapter implements PlatformAdapter {
   bool joinedHotspot = false;
   NearbyBoardBeacon? lastHostBeacon;
   bool serverRunning = false;
+  String? lastExportedFilename;
+  String? lastExportedText;
+  Uint8List? lastExportedBytes;
 
   @override
   bool get isWeb => false;
 
   @override
   bool get canPickImage => true;
+
+  @override
+  bool get canImportPdf => true;
 
   @override
   bool get canScanQrCode => true;
@@ -84,6 +91,27 @@ class _FakeAndroidPlatformAdapter implements PlatformAdapter {
   Future<String?> pickImageAsDataUrl() async => _tinyPngDataUrl;
 
   @override
+  Future<PdfImportedDocument?> pickAndRenderPdf({int maxPages = 30}) async =>
+      const PdfImportedDocument(
+        fileName: '线性代数讲义.pdf',
+        totalPages: 2,
+        pages: <PdfRenderedPage>[
+          PdfRenderedPage(
+            pageNumber: 1,
+            width: 595,
+            height: 842,
+            dataUrl: _tinyPngDataUrl,
+          ),
+          PdfRenderedPage(
+            pageNumber: 2,
+            width: 595,
+            height: 842,
+            dataUrl: _tinyPngDataUrl,
+          ),
+        ],
+      );
+
+  @override
   Future<String?> scanQrCode() async =>
       'http://192.168.1.66:8787/?room=study';
 
@@ -91,7 +119,22 @@ class _FakeAndroidPlatformAdapter implements PlatformAdapter {
   Future<String?> loadImagePathAsDataUrl(String filePath) async => null;
 
   @override
-  Future<String?> saveExportFile(String filename, String content) async => null;
+  Future<String?> saveExportFile(String filename, String content) async {
+    lastExportedFilename = filename;
+    lastExportedText = content;
+    return '/tmp/$filename';
+  }
+
+  @override
+  Future<String?> saveExportBytes(
+    String filename,
+    Uint8List bytes, {
+    String mimeType = 'image/png',
+  }) async {
+    lastExportedFilename = filename;
+    lastExportedBytes = bytes;
+    return '/tmp/$filename';
+  }
 
   @override
   Future<int?> startEmbeddedServer({int preferredPort = 8787}) async {
@@ -593,6 +636,192 @@ void main() {
         }
         expect(tabletCtrl.doc.deepDigest(), desktopCtrl.doc.deepDigest());
       }, _RealSocketHttpOverrides());
+    },
+  );
+
+  test(
+    'Lasso multi-select group actions, single-step compound Undo, Hold-to-Snap straight line, and PenPresets work cleanly',
+    () {
+      final ctrl = NotebookController(
+        initialPeerId: 'note-tools-peer',
+        initialDisplayName: 'Note Tester',
+        initialFormFactor: DeviceFormFactor.tablet,
+        autoConnect: false,
+      );
+      addTearDown(ctrl.dispose);
+
+      final pageId = ctrl.createPage(
+        title: '套索与拉直测试页',
+        background: PageBackground.mistakeBook,
+      );
+      expect(ctrl.activePageId, pageId);
+
+      // 1. Draw two strokes in known positions
+      ctrl.setActiveColor(const Color(0xFF0F172A));
+      ctrl.startLocalStroke(const Offset(100, 120));
+      ctrl.appendLocalStrokePoint(const Offset(140, 125));
+      ctrl.appendLocalStrokePoint(const Offset(180, 122));
+      ctrl.finishLocalStroke();
+
+      ctrl.startLocalStroke(const Offset(110, 180));
+      ctrl.appendLocalStrokePoint(const Offset(150, 185));
+      ctrl.appendLocalStrokePoint(const Offset(190, 182));
+      ctrl.finishLocalStroke();
+
+      expect(ctrl.activeElements.length, 2);
+      final s1 = ctrl.activeElements[0];
+      final s2 = ctrl.activeElements[1];
+
+      // 2. Circle both strokes with Lasso
+      ctrl.setTool(CanvasTool.lasso);
+      ctrl.startLasso(const Offset(80, 90));
+      ctrl.appendLassoPoint(const Offset(220, 90));
+      ctrl.appendLassoPoint(const Offset(220, 220));
+      ctrl.appendLassoPoint(const Offset(80, 220));
+      ctrl.finishLasso();
+
+      expect(ctrl.selectedElementIds.length, 2);
+      expect(ctrl.selectionBounds, isNotNull);
+
+      // 3. Group move both strokes + single-step compound Undo
+      final origins = ctrl.captureSelectedOrigins();
+      ctrl.previewMoveSelectedElements(origins, const Offset(50, 30));
+      ctrl.commitGroupMoveUndo(origins);
+      expect(ctrl.doc.getElement(s1.id)!.x, closeTo(s1.x + 50, 0.01));
+      expect(ctrl.doc.getElement(s2.id)!.y, closeTo(s2.y + 30, 0.01));
+
+      ctrl.undo();
+      expect(ctrl.doc.getElement(s1.id)!.x, closeTo(s1.x, 0.01));
+      expect(ctrl.doc.getElement(s2.id)!.y, closeTo(s2.y, 0.01));
+
+      // 4. Group recolor + duplicate + single-step compound Undo
+      ctrl.recolorSelectedElements(const Color(0xFFDC2626));
+      expect(ctrl.doc.getElement(s1.id)!.colorValue, 0xFFDC2626);
+      expect(ctrl.doc.getElement(s2.id)!.colorValue, 0xFFDC2626);
+
+      final cloned = ctrl.duplicateSelectedElements();
+      expect(cloned.length, 2);
+      expect(ctrl.activeElements.length, 4);
+      ctrl.undo();
+      expect(ctrl.activeElements.length, 2);
+
+      // 5. Hold-to-Snap wobbly freehand stroke -> straight line + rubber-band aiming
+      ctrl.setTool(CanvasTool.pen);
+      ctrl.startLocalStroke(const Offset(200, 300));
+      ctrl.appendLocalStrokePoint(const Offset(250, 318));
+      ctrl.appendLocalStrokePoint(const Offset(300, 289));
+      ctrl.appendLocalStrokePoint(const Offset(360, 305));
+      expect(ctrl.snapActiveStrokeToStraightLine(), isTrue);
+      expect(ctrl.isActiveStrokeSnappedLine, isTrue);
+
+      // Aim snapped line horizontally to (400, 300)
+      ctrl.appendLocalStrokePoint(const Offset(400, 300));
+      ctrl.finishLocalStroke();
+      final snappedStroke = ctrl.activeElements.last;
+      for (final p in snappedStroke.points) {
+        expect(snappedStroke.y + p.dy, closeTo(300.0, 0.05));
+      }
+
+      // 6. Pen presets apply & save
+      ctrl.applyPenPreset(2);
+      expect(ctrl.tool, CanvasTool.highlighter);
+      expect(ctrl.activePenPresetIndex, 2);
+      ctrl.setActiveColor(const Color(0xFF16A34A));
+      ctrl.saveCurrentToPenPreset(1);
+      expect(ctrl.penPresets[1].colorValue, 0xFF16A34A);
+    },
+  );
+
+  testWidgets(
+    'Multi-page PDF import creates locked PDF pages immune to eraser, supports search/bookmark, and exports PNG & Markdown',
+    (WidgetTester tester) async {
+      final adapter = _FakeAndroidPlatformAdapter();
+      addTearDown(adapter.dispose);
+
+      final ctrl = NotebookController(
+        platformAdapter: adapter,
+        initialPeerId: 'pdf-note-peer',
+        initialDisplayName: 'Mac PDF Tester',
+        initialFormFactor: DeviceFormFactor.desktop,
+        autoConnect: false,
+      );
+      addTearDown(ctrl.dispose);
+
+      await tester.binding.setSurfaceSize(const Size(1440, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      await tester.pumpWidget(SyncCanvasApp(controller: ctrl));
+      await tester.pumpAndSettle();
+
+      final initialPageCount = ctrl.activePages.length;
+
+      // 1. Import 2-page PDF via toolbar dialog
+      await tester.tap(find.byTooltip('导入 PDF 讲义'));
+      await tester.pumpAndSettle();
+      expect(find.text('导入 PDF 讲义 / 文档'), findsOneWidget);
+
+      await tester.tap(find.text('选择 PDF 并导入'));
+      await tester.pumpAndSettle();
+
+      expect(ctrl.activePages.length, initialPageCount + 2);
+      expect(ctrl.activePage!.title, '线性代数讲义 · P1');
+
+      final pdfSheet = ctrl.activeElements.single;
+      expect(pdfSheet.kind, ElementKind.image);
+      expect(pdfSheet.locked, isTrue);
+      expect(pdfSheet.zIndex, -100);
+
+      // 2. Annotate on top of PDF page and verify eraser NEVER deletes locked PDF sheet
+      ctrl.startLocalStroke(const Offset(200, 220));
+      ctrl.appendLocalStrokePoint(const Offset(260, 225));
+      ctrl.finishLocalStroke();
+      ctrl.createStickyNote(
+        sceneCenter: const Offset(360, 320),
+        initialText: '特征值与特征向量核心定理',
+      );
+      ctrl.setEditingCard(null);
+      await tester.pumpAndSettle();
+      expect(ctrl.activeElements.length, 3);
+
+      // Erase directly over the PDF sheet background & over the handwritten stroke
+      ctrl.eraseAt(const Offset(100, 100)); // hits only locked PDF sheet -> ignored
+      expect(ctrl.doc.getElement(pdfSheet.id)!.deleted, isFalse);
+
+      ctrl.eraseAt(const Offset(230, 222)); // erases handwritten stroke on top
+      expect(ctrl.activeElements.length, 2);
+      expect(ctrl.doc.getElement(pdfSheet.id)!.deleted, isFalse);
+
+      // 3. Bookmark active PDF page, switch templates cleanly, and run full-text search
+      ctrl.togglePageBookmark(ctrl.activePageId);
+      expect(ctrl.activePage!.bookmarked, isTrue);
+      ctrl.updatePageBackground(
+        ctrl.activePageId,
+        background: PageBackground.weeklyPlan,
+        paperColor: const Color(0xFF1E293B),
+      );
+      await tester.pumpAndSettle();
+
+      ctrl.goToNextPage();
+      expect(ctrl.activePage!.title, '线性代数讲义 · P2');
+
+      final hits = ctrl.searchWorkspaceContent('特征向量');
+      expect(hits, isNotEmpty);
+      ctrl.focusOnElement(hits.first.pageId, hits.first.elementId);
+      expect(ctrl.activePage!.title, '线性代数讲义 · P1');
+
+      // 4. Export full notebook Markdown & current page PNG
+      final mdPath = await ctrl.saveActiveNotebookMarkdown();
+      expect(mdPath, isNotNull);
+      expect(adapter.lastExportedText, contains('线性代数讲义 · P1 ⭐'));
+      expect(adapter.lastExportedText, contains('特征值与特征向量核心定理'));
+
+      // Note: ui.Picture.toImage in headless widget tests requires tester.runAsync
+      final pngPath = await tester.runAsync(() => ctrl.exportActivePagePng());
+      expect(pngPath, isNotNull);
+      expect(adapter.lastExportedBytes, isNotNull);
+      expect(adapter.lastExportedBytes!.length, greaterThan(64));
+      // Verify PNG magic signature: 89 50 4E 47
+      expect(adapter.lastExportedBytes!.sublist(0, 4), <int>[0x89, 0x50, 0x4E, 0x47]);
     },
   );
 }

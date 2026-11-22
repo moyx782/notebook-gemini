@@ -57,6 +57,72 @@
     For more details:
     * https://docs.flutter.dev/platform-integration/web/initialization
   -->
+  <script>
+    window.syncCanvasPickPdf = function(maxPages) {
+      var limit = (typeof maxPages === 'number' && maxPages > 0) ? maxPages : 30;
+      return new Promise(function(resolve) {
+        var input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'application/pdf,.pdf';
+        input.style.display = 'none';
+        var settled = false;
+        function finish(val) {
+          if (settled) return;
+          settled = true;
+          try { input.remove(); } catch (_) {}
+          resolve(val);
+        }
+        input.addEventListener('cancel', function() { finish(null); });
+        input.addEventListener('change', async function() {
+          try {
+            var file = input.files && input.files[0];
+            if (!file) { finish(null); return; }
+            var pdfjsUrl = new URL('pdfjs/pdf.min.mjs', document.baseURI).href;
+            var workerUrl = new URL('pdfjs/pdf.worker.min.mjs', document.baseURI).href;
+            var pdfjsLib = await import(pdfjsUrl);
+            pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+            var buf = await file.arrayBuffer();
+            var loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(buf) });
+            var pdf = await loadingTask.promise;
+            var count = Math.min(pdf.numPages, limit);
+            var pages = [];
+            for (var p = 1; p <= count; p++) {
+              var page = await pdf.getPage(p);
+              var baseVp = page.getViewport({ scale: 1.0 });
+              var maxDim = Math.max(baseVp.width, baseVp.height, 1);
+              var scale = Math.min(2.4, Math.max(1.0, 1440.0 / maxDim));
+              var vp = page.getViewport({ scale: scale });
+              var canvas = document.createElement('canvas');
+              canvas.width = Math.round(vp.width);
+              canvas.height = Math.round(vp.height);
+              var ctx = canvas.getContext('2d', { alpha: false });
+              ctx.fillStyle = '#ffffff';
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              await page.render({ canvasContext: ctx, viewport: vp }).promise;
+              pages.push({
+                pageNumber: p,
+                width: baseVp.width,
+                height: baseVp.height,
+                dataUrl: canvas.toDataURL('image/jpeg', 0.86)
+              });
+              canvas.width = 1;
+              canvas.height = 1;
+            }
+            finish(JSON.stringify({
+              fileName: file.name || 'document.pdf',
+              totalPages: pdf.numPages,
+              pages: pages
+            }));
+          } catch (err) {
+            console.error('PDF import failed:', err);
+            finish(JSON.stringify({ error: String(err) }));
+          }
+        });
+        document.body.appendChild(input);
+        input.click();
+      });
+    };
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

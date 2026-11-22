@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     squashfs-tools \
     file \
     desktop-file-utils \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git clone https://github.com/flutter/flutter.git -b stable --depth 1 /opt/flutter

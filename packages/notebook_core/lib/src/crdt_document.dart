@@ -439,6 +439,7 @@ class CrdtDocument {
       sortOrder: (r.raw('sortOrder') as num? ?? 0).toInt(),
       deleted: r.raw('deleted') as bool? ?? false,
       updatedAtMs: r.maxWallTimeMs(),
+      bookmarked: r.raw('bookmarked') as bool? ?? false,
     );
   }
 
@@ -467,6 +468,7 @@ class CrdtDocument {
       authorName: r.raw('authorName') as String? ?? '系统模板',
       deleted: r.raw('deleted') as bool? ?? false,
       updatedAtMs: r.maxWallTimeMs(),
+      locked: r.raw('locked') as bool? ?? false,
     );
   }
 

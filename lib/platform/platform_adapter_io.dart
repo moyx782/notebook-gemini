@@ -14,6 +14,8 @@ export 'platform_adapter_stub.dart'
         HotspotStartOutcome,
         HttpResponseData,
         OperationOutcome,
+        PdfImportedDocument,
+        PdfRenderedPage,
         PlatformAdapter;
 
 /// Resolves the offline Flutter Web bundle directory for the embedded host
@@ -212,7 +214,17 @@ class IoPlatformAdapter implements PlatformAdapter {
 
   @override
   bool get canPickImage =>
-      Platform.isAndroid || Platform.isLinux || Platform.isWindows;
+      Platform.isAndroid ||
+      Platform.isMacOS ||
+      Platform.isLinux ||
+      Platform.isWindows;
+
+  @override
+  bool get canImportPdf =>
+      Platform.isAndroid ||
+      Platform.isMacOS ||
+      Platform.isLinux ||
+      Platform.isWindows;
 
   @override
   bool get canScanQrCode => Platform.isAndroid;
@@ -331,7 +343,7 @@ class IoPlatformAdapter implements PlatformAdapter {
 
   @override
   Future<String?> pickImageAsDataUrl() async {
-    if (Platform.isAndroid) {
+    if (Platform.isAndroid || Platform.isMacOS) {
       try {
         return await _channel.invokeMethod<String>('pickImage');
       } catch (_) {
@@ -349,6 +361,318 @@ class IoPlatformAdapter implements PlatformAdapter {
       return loadImagePathAsDataUrl(path);
     }
     return null;
+  }
+
+  @override
+  Future<PdfImportedDocument?> pickAndRenderPdf({int maxPages = 30}) async {
+    final safeLimit = maxPages.clamp(1, 60);
+    if (Platform.isAndroid || Platform.isMacOS) {
+      try {
+        final rawJson = await _channel.invokeMethod<String>(
+          'pickPdf',
+          <String, Object?>{'maxPages': safeLimit},
+        );
+        return parsePdfImportJson(rawJson);
+      } catch (e) {
+        return PdfImportedDocument(
+          fileName: 'document.pdf',
+          totalPages: 0,
+          pages: const <PdfRenderedPage>[],
+          error: e.toString(),
+        );
+      }
+    }
+    if (Platform.isWindows) {
+      return _pickAndRenderWindowsPdf(maxPages: safeLimit);
+    }
+    if (Platform.isLinux) {
+      return _pickAndRenderLinuxPdf(maxPages: safeLimit);
+    }
+    return null;
+  }
+
+  Future<PdfImportedDocument?> _pickAndRenderWindowsPdf({
+    required int maxPages,
+  }) async {
+    final script = r'''
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+$owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }
+$dlg = New-Object System.Windows.Forms.OpenFileDialog
+$dlg.Title = 'Select PDF for SyncCanvas'
+$dlg.Filter = 'PDF Documents (*.pdf)|*.pdf|All Files (*.*)|*.*'
+$chosen = $null
+try {
+  if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+    $chosen = $dlg.FileName
+  }
+} finally {
+  $dlg.Dispose()
+  $owner.Dispose()
+}
+if ([string]::IsNullOrWhiteSpace($chosen)) { exit 0 }
+
+$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+$null = [Windows.Storage.StorageFolder, Windows.Storage, ContentType = WindowsRuntime]
+$null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+$null = [Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType = WindowsRuntime]
+$null = [Windows.Data.Pdf.PdfPageRenderOptions, Windows.Data.Pdf, ContentType = WindowsRuntime]
+
+$methods = [System.WindowsRuntimeSystemExtensions].GetMethods()
+$asTaskGeneric = ($methods | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethod })[0]
+$asTaskAction = ($methods | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and -not $_.IsGenericMethod -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
+
+function Await-Op($op, [type]$type) {
+  $m = $asTaskGeneric.MakeGenericMethod($type)
+  return $m.Invoke($null, @($op)).GetAwaiter().GetResult()
+}
+function Await-Action($act) {
+  [void]$asTaskAction.Invoke($null, @($act)).GetAwaiter().GetResult()
+}
+
+$tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("synccanvas_pdf_" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+try {
+  $storageFile = Await-Op ([Windows.Storage.StorageFile]::GetFileFromPathAsync($chosen)) ([Windows.Storage.StorageFile])
+  $pdfDoc = Await-Op ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($storageFile)) ([Windows.Data.Pdf.PdfDocument])
+  $folder = Await-Op ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync($tmpDir)) ([Windows.Storage.StorageFolder])
+  $total = [int]$pdfDoc.PageCount
+  $limit = [Math]::Min($total, __MAX_PAGES__)
+  $jpegCodec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
+  $encParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
+  $encParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, 85L)
+  $pagesOut = @()
+  for ($i = 0; $i -lt $limit; $i++) {
+    $page = $pdfDoc.GetPage([uint32]$i)
+    try {
+      $w = [double]$page.Size.Width
+      $h = [double]$page.Size.Height
+      $maxDim = [Math]::Max($w, $h)
+      $scale = [Math]::Min(2.2, [Math]::Max(1.0, 1440.0 / [Math]::Max(1.0, $maxDim)))
+      $opts = New-Object Windows.Data.Pdf.PdfPageRenderOptions
+      $opts.DestinationWidth = [uint32][Math]::Round($w * $scale)
+      $opts.DestinationHeight = [uint32][Math]::Round($h * $scale)
+      $pngName = "p_$i.png"
+      $outFile = Await-Op ($folder.CreateFileAsync($pngName, [Windows.Storage.CreationCollisionOption]::ReplaceExisting)) ([Windows.Storage.StorageFile])
+      $stream = Await-Op ($outFile.OpenAsync([Windows.Storage.FileAccessMode]::ReadWrite)) ([Windows.Storage.Streams.IRandomAccessStream])
+      try {
+        Await-Action ($page.RenderToStreamAsync($stream, $opts))
+      } finally {
+        $stream.Dispose()
+      }
+      $pngPath = Join-Path $tmpDir $pngName
+      $srcBmp = [System.Drawing.Image]::FromFile($pngPath)
+      try {
+        $whiteBmp = New-Object System.Drawing.Bitmap($srcBmp.Width, $srcBmp.Height)
+        try {
+          $g = [System.Drawing.Graphics]::FromImage($whiteBmp)
+          try {
+            $g.Clear([System.Drawing.Color]::White)
+            $g.DrawImage($srcBmp, 0, 0, $srcBmp.Width, $srcBmp.Height)
+          } finally {
+            $g.Dispose()
+          }
+          $ms = New-Object System.IO.MemoryStream
+          $whiteBmp.Save($ms, $jpegCodec, $encParams)
+          $b64 = [Convert]::ToBase64String($ms.ToArray())
+          $ms.Dispose()
+        } finally {
+          $whiteBmp.Dispose()
+        }
+      } finally {
+        $srcBmp.Dispose()
+      }
+      $pagesOut += @{
+        pageNumber = ($i + 1)
+        width = [Math]::Round($w, 2)
+        height = [Math]::Round($h, 2)
+        dataUrl = ("data:image/jpeg;base64," + $b64)
+      }
+    } finally {
+      $page.Dispose()
+    }
+  }
+  $payload = @{
+    fileName = [System.IO.Path]::GetFileName($chosen)
+    totalPages = $total
+    pages = @(,$pagesOut | ForEach-Object { $_ })
+  } | ConvertTo-Json -Compress -Depth 6
+  [Console]::Out.Write($payload)
+} catch {
+  $errPayload = @{ error = $_.Exception.Message } | ConvertTo-Json -Compress
+  [Console]::Out.Write($errPayload)
+} finally {
+  Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+}
+'''
+        .replaceAll('__MAX_PAGES__', '$maxPages');
+
+    try {
+      final res = await Process.run(
+        'powershell.exe',
+        <String>[
+          '-NoProfile',
+          '-NonInteractive',
+          '-Sta',
+          '-Command',
+          script,
+        ],
+        stdoutEncoding: utf8,
+        stderrEncoding: utf8,
+      );
+      final out = (res.stdout as String).trim();
+      if (out.isEmpty) return null;
+      return parsePdfImportJson(out);
+    } catch (e) {
+      return PdfImportedDocument(
+        fileName: 'document.pdf',
+        totalPages: 0,
+        pages: const <PdfRenderedPage>[],
+        error: e.toString(),
+      );
+    }
+  }
+
+  Future<PdfImportedDocument?> _pickAndRenderLinuxPdf({
+    required int maxPages,
+  }) async {
+    String? chosen;
+    try {
+      final res = await Process.run('zenity', <String>[
+        '--file-selection',
+        '--title=选择 PDF 导入笔记本',
+        '--file-filter=PDF 文档 (*.pdf) | *.pdf *.PDF',
+      ]);
+      if (res.exitCode == 0) {
+        final s = (res.stdout as String).trim();
+        if (s.isNotEmpty) chosen = s;
+      } else {
+        return null;
+      }
+    } catch (_) {
+      try {
+        final home = Platform.environment['HOME'] ?? '.';
+        final res = await Process.run('kdialog', <String>[
+          '--getopenfilename',
+          home,
+          '*.pdf *.PDF',
+        ]);
+        if (res.exitCode == 0) {
+          final s = (res.stdout as String).trim();
+          if (s.isNotEmpty) chosen = s;
+        }
+      } catch (_) {}
+    }
+
+    if (chosen == null || chosen.isEmpty) return null;
+    final tmpDir = await Directory.systemTemp.createTemp('synccanvas_pdf_');
+    try {
+      var rendered = false;
+      try {
+        final ppm = await Process.run('pdftoppm', <String>[
+          '-jpeg',
+          '-jpegopt',
+          'quality=85',
+          '-scale-to',
+          '1440',
+          '-f',
+          '1',
+          '-l',
+          '$maxPages',
+          chosen,
+          '${tmpDir.path}/page',
+        ]);
+        rendered = ppm.exitCode == 0;
+      } catch (_) {}
+
+      if (!rendered) {
+        try {
+          final gs = await Process.run('gs', <String>[
+            '-dNOPAUSE',
+            '-dBATCH',
+            '-dSAFER',
+            '-sDEVICE=jpeg',
+            '-dJPEGQ=85',
+            '-r144',
+            '-dFirstPage=1',
+            '-dLastPage=$maxPages',
+            '-sOutputFile=${tmpDir.path}/page-%03d.jpg',
+            chosen,
+          ]);
+          rendered = gs.exitCode == 0;
+        } catch (_) {}
+      }
+
+      if (!rendered) {
+        return const PdfImportedDocument(
+          fileName: 'document.pdf',
+          totalPages: 0,
+          pages: <PdfRenderedPage>[],
+          error: '未找到 pdftoppm (poppler-utils) 或 gs (ghostscript) 渲染工具',
+        );
+      }
+
+      final jpgFiles = tmpDir
+          .listSync()
+          .whereType<File>()
+          .where((f) {
+            final lower = f.path.toLowerCase();
+            return lower.endsWith('.jpg') || lower.endsWith('.jpeg');
+          })
+          .toList()
+        ..sort((a, b) => a.path.compareTo(b.path));
+
+      final pages = <PdfRenderedPage>[];
+      for (var i = 0; i < jpgFiles.length; i++) {
+        final bytes = await jpgFiles[i].readAsBytes();
+        final dims = _readJpegDimensions(bytes);
+        pages.add(
+          PdfRenderedPage(
+            pageNumber: i + 1,
+            width: dims.$1,
+            height: dims.$2,
+            dataUrl: 'data:image/jpeg;base64,${base64Encode(bytes)}',
+          ),
+        );
+      }
+      final fileName = chosen.split(Platform.pathSeparator).last;
+      return PdfImportedDocument(
+        fileName: fileName,
+        totalPages: pages.length,
+        pages: pages,
+      );
+    } finally {
+      try {
+        await tmpDir.delete(recursive: true);
+      } catch (_) {}
+    }
+  }
+
+  (double, double) _readJpegDimensions(Uint8List bytes) {
+    var i = 2;
+    while (i + 9 < bytes.length) {
+      if (bytes[i] != 0xFF) {
+        i++;
+        continue;
+      }
+      final marker = bytes[i + 1];
+      if (marker == 0xC0 || marker == 0xC1 || marker == 0xC2) {
+        final h = (bytes[i + 5] << 8) | bytes[i + 6];
+        final w = (bytes[i + 7] << 8) | bytes[i + 8];
+        if (w > 0 && h > 0) return (w.toDouble(), h.toDouble());
+      }
+      if (marker == 0xD8 || marker == 0xD9 || marker == 0x00) {
+        i += 2;
+        continue;
+      }
+      final segLen = (bytes[i + 2] << 8) | bytes[i + 3];
+      if (segLen < 2) break;
+      i += 2 + segLen;
+    }
+    return (794.0, 1123.0);
   }
 
   Future<String?> _pickWindowsImageFilePath() async {
@@ -450,12 +774,46 @@ try {
     }
   }
 
+  Future<Directory> _resolveExportDir() async {
+    if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
+      final sep = Platform.pathSeparator;
+      final home = Platform.isWindows
+          ? Platform.environment['USERPROFILE']?.trim()
+          : Platform.environment['HOME']?.trim();
+      if (home != null && home.isNotEmpty) {
+        final downloads = Directory('$home${sep}Downloads');
+        try {
+          if (await downloads.exists()) {
+            return downloads;
+          }
+        } catch (_) {}
+      }
+    }
+    return _ensureCacheDir();
+  }
+
   @override
   Future<String?> saveExportFile(String filename, String content) async {
     try {
-      final dir = await _ensureCacheDir();
+      final dir = await _resolveExportDir();
       final out = File('${dir.path}${Platform.pathSeparator}$filename');
       await out.writeAsString(content, flush: true);
+      return out.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  Future<String?> saveExportBytes(
+    String filename,
+    Uint8List bytes, {
+    String mimeType = 'image/png',
+  }) async {
+    try {
+      final dir = await _resolveExportDir();
+      final out = File('${dir.path}${Platform.pathSeparator}$filename');
+      await out.writeAsBytes(bytes, flush: true);
       return out.path;
     } catch (_) {
       return null;

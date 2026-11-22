@@ -1,6 +1,8 @@
 import Cocoa
 import CoreBluetooth
 import FlutterMacOS
+import PDFKit
+import UniformTypeIdentifiers
 
 class MainFlutterWindow: NSWindow {
   private var bleBridge: SyncCanvasMacBleBridge?
@@ -68,11 +70,201 @@ private final class SyncCanvasMacBleBridge: NSObject, CBCentralManagerDelegate, 
       result(true)
     case "startLocalHotspot", "connectToHotspot":
       result(["ok": false, "error": "仅 Android 原生端支持自动热点切换"])
-    case "getAppFilesDir", "pickImage", "scanQrCode":
+    case "getAppFilesDir":
+      let appSupport = FileManager.default.urls(
+        for: .applicationSupportDirectory,
+        in: .userDomainMask
+      ).first?.path
+      result(appSupport)
+    case "pickImage":
+      pickImage(result: result)
+    case "pickPdf":
+      let args = call.arguments as? [String: Any]
+      let maxPages = max(1, min(120, args?["maxPages"] as? Int ?? 30))
+      pickPdf(maxPages: maxPages, result: result)
+    case "scanQrCode":
       result(nil)
     default:
       result(FlutterMethodNotImplemented)
     }
+  }
+
+  private func pickImage(result: @escaping FlutterResult) {
+    DispatchQueue.main.async {
+      let panel = NSOpenPanel()
+      panel.canChooseFiles = true
+      panel.canChooseDirectories = false
+      panel.allowsMultipleSelection = false
+      if #available(macOS 11.0, *) {
+        panel.allowedContentTypes = [.image]
+      } else {
+        panel.allowedFileTypes = ["png", "jpg", "jpeg", "webp", "gif"]
+      }
+      panel.begin { response in
+        guard response == .OK, let url = panel.url else {
+          result(nil)
+          return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+          let dataUrl = Self.encodeImageToDataUrl(url: url)
+          DispatchQueue.main.async {
+            result(dataUrl)
+          }
+        }
+      }
+    }
+  }
+
+  private static func encodeImageToDataUrl(url: URL) -> String? {
+    guard let image = NSImage(contentsOf: url) else { return nil }
+    var proposedRect = NSRect(origin: .zero, size: image.size)
+    guard let cgImg = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
+      return nil
+    }
+    let rawW = max(1, cgImg.width)
+    let rawH = max(1, cgImg.height)
+    let maxSide = max(rawW, rawH)
+    let scale = maxSide > 1600 ? (1600.0 / Double(maxSide)) : 1.0
+    let targetW = max(1, Int((Double(rawW) * scale).rounded()))
+    let targetH = max(1, Int((Double(rawH) * scale).rounded()))
+
+    guard let rep = NSBitmapImageRep(
+      bitmapDataPlanes: nil,
+      pixelsWide: targetW,
+      pixelsHigh: targetH,
+      bitsPerSample: 8,
+      samplesPerPixel: 4,
+      hasAlpha: true,
+      isPlanar: false,
+      colorSpaceName: .deviceRGB,
+      bytesPerRow: 0,
+      bitsPerPixel: 0
+    ) else {
+      return nil
+    }
+
+    NSGraphicsContext.saveGraphicsState()
+    if let ctx = NSGraphicsContext(bitmapImageRep: rep) {
+      NSGraphicsContext.current = ctx
+      ctx.imageInterpolation = .high
+      NSImage(cgImage: cgImg, size: NSSize(width: targetW, height: targetH))
+        .draw(in: NSRect(x: 0, y: 0, width: targetW, height: targetH))
+    }
+    NSGraphicsContext.restoreGraphicsState()
+
+    let ext = url.pathExtension.lowercased()
+    if ext == "png",
+       max(targetW, targetH) <= 1200,
+       let pngData = rep.representation(using: .png, properties: [:]),
+       pngData.count <= 700_000 {
+      return "data:image/png;base64,\(pngData.base64EncodedString())"
+    }
+    guard let jpegData = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.86]) else {
+      return nil
+    }
+    return "data:image/jpeg;base64,\(jpegData.base64EncodedString())"
+  }
+
+  private func pickPdf(maxPages: Int, result: @escaping FlutterResult) {
+    DispatchQueue.main.async {
+      let panel = NSOpenPanel()
+      panel.canChooseFiles = true
+      panel.canChooseDirectories = false
+      panel.allowsMultipleSelection = false
+      if #available(macOS 11.0, *) {
+        panel.allowedContentTypes = [.pdf]
+      } else {
+        panel.allowedFileTypes = ["pdf"]
+      }
+      panel.begin { response in
+        guard response == .OK, let url = panel.url else {
+          result(nil)
+          return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+          let jsonStr = Self.renderPdfToJson(url: url, maxPages: maxPages)
+          DispatchQueue.main.async {
+            result(jsonStr)
+          }
+        }
+      }
+    }
+  }
+
+  private static func renderPdfToJson(url: URL, maxPages: Int) -> String {
+    let fileName = url.lastPathComponent.isEmpty ? "document.pdf" : url.lastPathComponent
+    guard let doc = PDFDocument(url: url) else {
+      let errObj: [String: Any] = ["fileName": fileName, "error": "无法解析该 PDF 文件"]
+      let data = (try? JSONSerialization.data(withJSONObject: errObj)) ?? Data()
+      return String(data: data, encoding: .utf8) ?? "{}"
+    }
+
+    let totalPages = doc.pageCount
+    let limit = min(totalPages, maxPages)
+    var pagesJson: [[String: Any]] = []
+
+    for i in 0..<limit {
+      autoreleasepool {
+        guard let page = doc.page(at: i) else { return }
+        let rawBounds = page.bounds(for: .mediaBox)
+        let rot = ((page.rotation % 360) + 360) % 360
+        let pageW = (rot == 90 || rot == 270) ? rawBounds.height : rawBounds.width
+        let pageH = (rot == 90 || rot == 270) ? rawBounds.width : rawBounds.height
+        let safeW = max(1.0, Double(pageW))
+        let safeH = max(1.0, Double(pageH))
+        let maxSide = max(safeW, safeH)
+        let scale = min(2.4, max(0.25, 1440.0 / maxSide))
+        let pxW = max(1, Int((safeW * scale).rounded()))
+        let pxH = max(1, Int((safeH * scale).rounded()))
+
+        let thumb = page.thumbnail(of: NSSize(width: pxW, height: pxH), for: .mediaBox)
+        guard let rep = NSBitmapImageRep(
+          bitmapDataPlanes: nil,
+          pixelsWide: pxW,
+          pixelsHigh: pxH,
+          bitsPerSample: 8,
+          samplesPerPixel: 4,
+          hasAlpha: true,
+          isPlanar: false,
+          colorSpaceName: .deviceRGB,
+          bytesPerRow: 0,
+          bitsPerPixel: 0
+        ) else {
+          return
+        }
+
+        NSGraphicsContext.saveGraphicsState()
+        if let ctx = NSGraphicsContext(bitmapImageRep: rep) {
+          NSGraphicsContext.current = ctx
+          ctx.imageInterpolation = .high
+          NSColor.white.setFill()
+          NSRect(x: 0, y: 0, width: pxW, height: pxH).fill()
+          thumb.draw(in: NSRect(x: 0, y: 0, width: pxW, height: pxH))
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        if let jpegData = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.86]) {
+          pagesJson.append([
+            "pageNumber": i + 1,
+            "width": pxW,
+            "height": pxH,
+            "dataUrl": "data:image/jpeg;base64,\(jpegData.base64EncodedString())"
+          ])
+        }
+      }
+    }
+
+    let payload: [String: Any] = [
+      "fileName": fileName,
+      "totalPages": totalPages,
+      "pages": pagesJson
+    ]
+    guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+          let str = String(data: jsonData, encoding: .utf8)
+    else {
+      return "{}"
+    }
+    return str
   }
 
   private func startAdvertising(json: String, result: @escaping FlutterResult) {

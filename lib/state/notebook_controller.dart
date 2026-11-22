@@ -1,15 +1,20 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:notebook_core/notebook_core.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import '../canvas/canvas_painter.dart';
+import '../canvas/stroke_geometry.dart';
 import '../platform/platform_adapter.dart';
 
 enum CanvasTool {
   select('选择', 'V'),
+  lasso('套索', 'G'),
   pen('钢笔', 'P'),
   highlighter('荧光笔', 'H'),
   eraser('橡皮擦', 'E'),
@@ -129,6 +134,52 @@ class JoinBoardOutcome {
   final String? error;
 }
 
+class PenPreset {
+  const PenPreset({
+    required this.label,
+    required this.isHighlighter,
+    required this.colorValue,
+    required this.width,
+  });
+
+  final String label;
+  final bool isHighlighter;
+  final int colorValue;
+  final double width;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'label': label,
+        'isHighlighter': isHighlighter,
+        'colorValue': colorValue,
+        'width': width,
+      };
+
+  factory PenPreset.fromJson(Map<String, dynamic> json) => PenPreset(
+        label: json['label'] as String? ?? '预设笔',
+        isHighlighter: json['isHighlighter'] as bool? ?? false,
+        colorValue: (json['colorValue'] as num? ?? 0xFF0F172A).toInt(),
+        width: (json['width'] as num? ?? 3.5).toDouble(),
+      );
+}
+
+class SearchHit {
+  const SearchHit({
+    required this.notebookId,
+    required this.notebookTitle,
+    required this.pageId,
+    required this.pageTitle,
+    required this.snippet,
+    this.elementId,
+  });
+
+  final String notebookId;
+  final String notebookTitle;
+  final String pageId;
+  final String pageTitle;
+  final String snippet;
+  final String? elementId;
+}
+
 class NotebookController extends ChangeNotifier {
   NotebookController({
     PlatformAdapter? platformAdapter,
@@ -170,11 +221,12 @@ class NotebookController extends ChangeNotifier {
   ];
 
   static const List<Color> paperPalette = <Color>[
-    Color(0xFFFFFDF9),
-    Color(0xFFFFFFFF),
-    Color(0xFFF8FAFC),
-    Color(0xFFFEFCE8),
-    Color(0xFFF1F5F9),
+    Color(0xFFFFFDF9), // 暖白纸
+    Color(0xFFFFFFFF), // 纯白纸
+    Color(0xFFFBF5E6), // 羊皮护眼黄
+    Color(0xFFECFDF5), // 豆沙护眼绿
+    Color(0xFFF1F5F9), // 极简浅灰
+    Color(0xFF1E293B), // 深色黑板
   ];
 
   final bool _ownsPlatformAdapter;
@@ -221,12 +273,15 @@ class NotebookController extends ChangeNotifier {
   int _pendingStrokeEndColor = 0;
   double _pendingStrokeEndWidth = 3.5;
   double _activeStrokePathLength = 0.0;
-  final List<UndoPatch> _undoStack = <UndoPatch>[];
-  final List<UndoPatch> _redoStack = <UndoPatch>[];
+  bool _isActiveStrokeSnappedLine = false;
+  final List<List<UndoPatch>> _undoStack = <List<UndoPatch>>[];
+  final List<List<UndoPatch>> _redoStack = <List<UndoPatch>>[];
 
   String _activeNotebookId = 'nb-welcome';
   String _activePageId = 'page-brainstorm';
   String? _selectedElementId;
+  final Set<String> _selectedElementIds = <String>{};
+  final List<Offset> _activeLassoPoints = <Offset>[];
   String? _editingCardId;
   String? _followingPeerId;
 
@@ -237,7 +292,29 @@ class NotebookController extends ChangeNotifier {
   bool _stylusOnlyMode = false;
   bool _phoneBrowseOnlyMode = false;
   bool _sidebarOpen = true;
+  bool _showPageGuide = true;
+  bool _bookmarkFilterOnly = false;
   String _searchQuery = '';
+  final List<PenPreset> _penPresets = <PenPreset>[
+    const PenPreset(
+      label: '黑细字笔',
+      isHighlighter: false,
+      colorValue: 0xFF0F172A,
+      width: 2.6,
+    ),
+    const PenPreset(
+      label: '红批注笔',
+      isHighlighter: false,
+      colorValue: 0xFFDC2626,
+      width: 3.5,
+    ),
+    const PenPreset(
+      label: '黄荧光笔',
+      isHighlighter: true,
+      colorValue: 0xFFEAB308,
+      width: 20.0,
+    ),
+  ];
 
   Offset _panOffset = const Offset(24, 24);
   double _zoom = 1.0;
@@ -292,6 +369,9 @@ class NotebookController extends ChangeNotifier {
   String get activeNotebookId => _activeNotebookId;
   String get activePageId => _activePageId;
   String? get selectedElementId => _selectedElementId;
+  Set<String> get selectedElementIds => _selectedElementIds;
+  List<Offset> get activeLassoPoints => _activeLassoPoints;
+  bool get hasMultiSelection => _selectedElementIds.isNotEmpty;
   String? get editingCardId => _editingCardId;
   String? get followingPeerId => _followingPeerId;
 
@@ -302,7 +382,53 @@ class NotebookController extends ChangeNotifier {
   bool get stylusOnlyMode => _stylusOnlyMode;
   bool get phoneBrowseOnlyMode => _phoneBrowseOnlyMode;
   bool get sidebarOpen => _sidebarOpen;
+  bool get showPageGuide => _showPageGuide;
+  bool get bookmarkFilterOnly => _bookmarkFilterOnly;
   String get searchQuery => _searchQuery;
+  List<PenPreset> get penPresets => List<PenPreset>.unmodifiable(_penPresets);
+  bool get isActiveStrokeSnappedLine => _isActiveStrokeSnappedLine;
+
+  int? get activePenPresetIndex {
+    for (var i = 0; i < _penPresets.length; i++) {
+      final p = _penPresets[i];
+      final expectedTool =
+          p.isHighlighter ? CanvasTool.highlighter : CanvasTool.pen;
+      final currentW = p.isHighlighter ? _highlighterWidth : _strokeWidth;
+      if (_tool == expectedTool &&
+          _activeColor.toARGB32() == p.colorValue &&
+          (currentW - p.width).abs() < 0.25) {
+        return i;
+      }
+    }
+    return null;
+  }
+
+  Rect? get selectionBounds {
+    if (_selectedElementIds.isEmpty) return null;
+    Rect? union;
+    for (final id in _selectedElementIds) {
+      final el = _doc.getElement(id);
+      if (el == null || el.deleted || el.pageId != _activePageId) continue;
+      final rawB = el.bounds;
+      final b = Rect.fromLTRB(rawB.left, rawB.top, rawB.right, rawB.bottom);
+      union = union == null ? b : union.expandToInclude(b);
+    }
+    return union;
+  }
+
+  int get activePageIndex {
+    final pages = activePages;
+    for (var i = 0; i < pages.length; i++) {
+      if (pages[i].id == _activePageId) return i;
+    }
+    return pages.isEmpty ? -1 : 0;
+  }
+
+  bool get hasPrevPage => activePageIndex > 0;
+  bool get hasNextPage {
+    final idx = activePageIndex;
+    return idx >= 0 && idx < activePages.length - 1;
+  }
 
   Offset get panOffset => _panOffset;
   double get zoom => _zoom;
@@ -409,19 +535,71 @@ class NotebookController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void setBookmarkFilterOnly(bool enabled) {
+    if (_bookmarkFilterOnly == enabled) return;
+    _bookmarkFilterOnly = enabled;
+    notifyListeners();
+  }
+
+  void togglePageGuide() {
+    _showPageGuide = !_showPageGuide;
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  void applyPenPreset(int index) {
+    if (index < 0 || index >= _penPresets.length) return;
+    final p = _penPresets[index];
+    _tool = p.isHighlighter ? CanvasTool.highlighter : CanvasTool.pen;
+    _activeColor = Color(p.colorValue);
+    if (p.isHighlighter) {
+      _highlighterWidth = p.width.clamp(8.0, 42.0);
+    } else {
+      _strokeWidth = p.width.clamp(1.5, 18.0);
+    }
+    _editingCardId = null;
+    notifyListeners();
+  }
+
+  void saveCurrentToPenPreset(int index) {
+    if (index < 0 || index >= _penPresets.length) return;
+    final isHl = _tool == CanvasTool.highlighter;
+    final w = isHl ? _highlighterWidth : _strokeWidth;
+    final label = isHl
+        ? '荧光 ${w.round()}px'
+        : '钢笔 ${w.toStringAsFixed(1)}px';
+    _penPresets[index] = PenPreset(
+      label: label,
+      isHighlighter: isHl,
+      colorValue: _activeColor.toARGB32(),
+      width: w,
+    );
+    _scheduleSave();
+    notifyListeners();
+  }
+
   void setTool(CanvasTool nextTool) {
     _tool = nextTool;
+    _activeLassoPoints.clear();
     if (nextTool != CanvasTool.select) {
       _editingCardId = null;
     }
+    if (nextTool != CanvasTool.select && nextTool != CanvasTool.lasso) {
+      _selectedElementIds.clear();
+    }
+    _bumpLivePaint();
     notifyListeners();
   }
 
   void setActiveColor(Color color) {
     _activeColor = color;
+    if (_selectedElementIds.isNotEmpty) {
+      recolorSelectedElements(color);
+      return;
+    }
     if (_selectedElementId != null) {
       final el = _doc.getElement(_selectedElementId!);
-      if (el != null && !el.deleted) {
+      if (el != null && !el.deleted && !el.locked) {
         final fieldKey = el.kind == ElementKind.stickyNote
             ? 'fillColorValue'
             : 'colorValue';
@@ -457,11 +635,28 @@ class NotebookController extends ChangeNotifier {
   }
 
   void selectElement(String? elementId) {
-    if (_selectedElementId == elementId) return;
+    if (_selectedElementId == elementId && _selectedElementIds.isEmpty) return;
     _selectedElementId = elementId;
+    _selectedElementIds.clear();
     if (elementId != _editingCardId) {
       _editingCardId = null;
     }
+    _bumpLivePaint();
+    notifyListeners();
+  }
+
+  void clearSelection() {
+    if (_selectedElementId == null &&
+        _selectedElementIds.isEmpty &&
+        _editingCardId == null &&
+        _activeLassoPoints.isEmpty) {
+      return;
+    }
+    _selectedElementId = null;
+    _selectedElementIds.clear();
+    _editingCardId = null;
+    _activeLassoPoints.clear();
+    _bumpLivePaint();
     notifyListeners();
   }
 
@@ -514,6 +709,8 @@ class NotebookController extends ChangeNotifier {
       _activePageId = pages.first.id;
     }
     _selectedElementId = null;
+    _selectedElementIds.clear();
+    _activeLassoPoints.clear();
     _editingCardId = null;
     _followingPeerId = null;
     _bumpLivePaint();
@@ -530,10 +727,195 @@ class NotebookController extends ChangeNotifier {
     _activeNotebookId = page.notebookId;
     _activePageId = page.id;
     _selectedElementId = null;
+    _selectedElementIds.clear();
+    _activeLassoPoints.clear();
     _editingCardId = null;
     _bumpLivePaint();
     notifyListeners();
     sendPresence(force: true);
+  }
+
+  void goToPrevPage() {
+    final idx = activePageIndex;
+    if (idx > 0) {
+      selectPage(activePages[idx - 1].id);
+    }
+  }
+
+  void goToNextPage() {
+    final pages = activePages;
+    final idx = activePageIndex;
+    if (idx >= 0 && idx < pages.length - 1) {
+      selectPage(pages[idx + 1].id);
+    }
+  }
+
+  void togglePageBookmark(String pageId) {
+    final page = _doc.getPage(pageId);
+    if (page == null || page.deleted) return;
+    _commitPatch(
+      EntityType.page,
+      pageId,
+      <String, Object?>{'bookmarked': !page.bookmarked},
+    );
+  }
+
+  String? duplicatePage(String pageId) {
+    final src = _doc.getPage(pageId);
+    if (src == null || src.deleted) return null;
+    final siblings = _doc.pagesForNotebook(src.notebookId);
+    final newPageId = _newEntityId('page');
+    final ops = <CrdtOp>[];
+    final undoGroup = <UndoPatch>[];
+
+    final pagePair = _doc.mutateEntity(
+      entityType: EntityType.page,
+      entityId: newPageId,
+      fields: <String, Object?>{
+        'notebookId': src.notebookId,
+        'title': '${src.title} (副本)',
+        'background': src.background.name,
+        'backgroundColorValue': src.backgroundColorValue,
+        'sortOrder': siblings.length,
+        'bookmarked': src.bookmarked,
+        'deleted': false,
+      },
+    );
+    ops.add(pagePair.forward);
+    undoGroup.add(pagePair.undoPatch);
+
+    for (final el in _doc.elementsForPage(pageId)) {
+      if (el.deleted) continue;
+      final clonedId = _newEntityId('el');
+      final elPair = _doc.mutateEntity(
+        entityType: EntityType.element,
+        entityId: clonedId,
+        fields: <String, Object?>{
+          'pageId': newPageId,
+          'kind': el.kind.name,
+          'shapeKind': el.shapeKind.name,
+          'x': el.x,
+          'y': el.y,
+          'width': el.width,
+          'height': el.height,
+          'colorValue': el.colorValue,
+          'fillColorValue': el.fillColorValue,
+          'strokeWidth': el.strokeWidth,
+          'text': el.text,
+          'imageUri': el.imageUri,
+          'points': el.points.map((p) => p.toCompactJson()).toList(),
+          'zIndex': el.zIndex,
+          'locked': el.locked,
+          'authorId': _peerId,
+          'authorName': _displayName,
+          'deleted': false,
+        },
+      );
+      ops.add(elPair.forward);
+      undoGroup.add(elPair.undoPatch);
+    }
+
+    _pushUndoGroup(undoGroup);
+    _activeNotebookId = src.notebookId;
+    _activePageId = newPageId;
+    _selectedElementId = null;
+    _selectedElementIds.clear();
+    _editingCardId = null;
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(ops);
+    notifyListeners();
+    sendPresence(force: true);
+    return newPageId;
+  }
+
+  void movePageOrder(String pageId, int delta) {
+    final page = _doc.getPage(pageId);
+    if (page == null || page.deleted || delta == 0) return;
+    final pages = List<NotebookPageModel>.from(
+      _doc.pagesForNotebook(page.notebookId),
+    );
+    final idx = pages.indexWhere((p) => p.id == pageId);
+    if (idx < 0) return;
+    final targetIdx = idx + delta;
+    if (targetIdx < 0 || targetIdx >= pages.length) return;
+
+    final moved = pages.removeAt(idx);
+    pages.insert(targetIdx, moved);
+
+    final ops = <CrdtOp>[];
+    final undoGroup = <UndoPatch>[];
+    for (var i = 0; i < pages.length; i++) {
+      if (pages[i].sortOrder == i) continue;
+      final pair = _doc.mutateEntity(
+        entityType: EntityType.page,
+        entityId: pages[i].id,
+        fields: <String, Object?>{'sortOrder': i},
+      );
+      ops.add(pair.forward);
+      undoGroup.add(pair.undoPatch);
+    }
+    if (ops.isEmpty) return;
+    _pushUndoGroup(undoGroup);
+    _dispatchOps(ops);
+    notifyListeners();
+  }
+
+  List<SearchHit> searchWorkspaceContent(String rawQuery) {
+    final q = rawQuery.trim().toLowerCase();
+    if (q.isEmpty) return const <SearchHit>[];
+    final hits = <SearchHit>[];
+    for (final nb in notebooks) {
+      for (final page in _doc.pagesForNotebook(nb.id)) {
+        for (final el in _doc.elementsForPage(page.id)) {
+          if (el.deleted) continue;
+          final cleanText = el.text.trim();
+          if (cleanText.isEmpty) continue;
+          final lower = cleanText.toLowerCase();
+          final pos = lower.indexOf(q);
+          if (pos < 0) continue;
+          final singleLine = cleanText.replaceAll(RegExp(r'\s+'), ' ');
+          final snippetStart = math.max(0, pos - 12);
+          final snippetEnd = math.min(singleLine.length, pos + q.length + 26);
+          final prefix = snippetStart > 0 ? '…' : '';
+          final suffix = snippetEnd < singleLine.length ? '…' : '';
+          hits.add(
+            SearchHit(
+              notebookId: nb.id,
+              notebookTitle: nb.title,
+              pageId: page.id,
+              pageTitle: page.title,
+              snippet:
+                  '$prefix${singleLine.substring(snippetStart, math.max(snippetStart, snippetEnd))}$suffix',
+              elementId: el.id,
+            ),
+          );
+          if (hits.length >= 24) return hits;
+        }
+      }
+    }
+    return hits;
+  }
+
+  void focusOnElement(String pageId, String? elementId) {
+    selectPage(pageId);
+    if (elementId == null) return;
+    final el = _doc.getElement(elementId);
+    if (el == null || el.deleted) return;
+    if (!el.locked) {
+      _selectedElementId = el.id;
+    }
+    final rawB = el.bounds;
+    final center = Offset(
+      (rawB.left + rawB.right) * 0.5,
+      (rawB.top + rawB.bottom) * 0.5,
+    );
+    _panOffset = Offset(
+      _viewportSize.width * 0.5 - center.dx * _zoom,
+      _viewportSize.height * 0.5 - center.dy * _zoom,
+    );
+    _bumpLivePaint();
+    notifyListeners();
   }
 
   void toggleFollowPeer(String peerId) {
@@ -705,6 +1087,7 @@ class NotebookController extends ChangeNotifier {
     final strokeId = _newEntityId('el');
     _strokeStreamSeq = 0;
     _activeStrokePathLength = 0.0;
+    _isActiveStrokeSnappedLine = false;
 
     _activeStroke = ActiveStrokePreview(
       strokeId: strokeId,
@@ -733,6 +1116,26 @@ class NotebookController extends ChangeNotifier {
   }) {
     final stroke = _activeStroke;
     if (stroke == null) return;
+
+    if (_isActiveStrokeSnappedLine && stroke.points.isNotEmpty) {
+      final start = stroke.points.first;
+      final end = scenePos;
+      final chordDist = (end - Offset(start.dx, start.dy)).distance;
+      stroke.points
+        ..clear()
+        ..addAll(
+          _buildStraightLineStrokePoints(
+            Offset(start.dx, start.dy),
+            end,
+            pressure: pressure.clamp(0.45, 0.85),
+          ),
+        );
+      _activeStrokePathLength = chordDist;
+      _bumpLivePaint();
+      _scheduleLiveStrokeStream();
+      return;
+    }
+
     final last = stroke.points.last;
     final dx = scenePos.dx - last.dx;
     final dy = scenePos.dy - last.dy;
@@ -753,6 +1156,60 @@ class NotebookController extends ChangeNotifier {
     _scheduleLiveStrokeStream();
   }
 
+  /// Snaps the active freehand stroke into a clean straight line when the user
+  /// pauses at the end of a stroke (Hold-to-Snap, ~380ms). While the user keeps
+  /// holding and dragging, the straight line's endpoint tracks the pointer.
+  bool snapActiveStrokeToStraightLine() {
+    final stroke = _activeStroke;
+    if (stroke == null || _isActiveStrokeSnappedLine || stroke.points.length < 3) {
+      return false;
+    }
+    final start = Offset(stroke.points.first.dx, stroke.points.first.dy);
+    final end = Offset(stroke.points.last.dx, stroke.points.last.dy);
+    final chordDist = (end - start).distance;
+    if (chordDist < 16.0) return false;
+    if (_activeStrokePathLength > 1.0 &&
+        chordDist < _activeStrokePathLength * 0.42) {
+      // Closed loops / circles should stay freehand rather than collapsing to a tiny segment.
+      return false;
+    }
+    final avgPressure = stroke.points
+            .fold<double>(0.0, (sum, p) => sum + p.pressure) /
+        stroke.points.length;
+    stroke.points
+      ..clear()
+      ..addAll(
+        _buildStraightLineStrokePoints(
+          start,
+          end,
+          pressure: avgPressure.clamp(0.45, 0.85),
+        ),
+      );
+    _isActiveStrokeSnappedLine = true;
+    _activeStrokePathLength = chordDist;
+    _bumpLivePaint();
+    _scheduleLiveStrokeStream();
+    return true;
+  }
+
+  List<StrokePoint> _buildStraightLineStrokePoints(
+    Offset start,
+    Offset end, {
+    double pressure = 0.68,
+    int segments = 12,
+  }) {
+    final count = math.max(2, segments);
+    return List<StrokePoint>.generate(count + 1, (i) {
+      final t = i / count;
+      return StrokePoint(
+        dx: start.dx + (end.dx - start.dx) * t,
+        dy: start.dy + (end.dy - start.dy) * t,
+        pressure: pressure,
+        dtMs: i == 0 ? 0 : 8,
+      );
+    });
+  }
+
   void finishLocalStroke() {
     _liveStrokeStreamTimer?.cancel();
     _liveStrokeStreamTimer = null;
@@ -761,6 +1218,7 @@ class NotebookController extends ChangeNotifier {
     if (stroke == null) return;
     _activeStroke = null;
     _activeStrokePathLength = 0.0;
+    _isActiveStrokeSnappedLine = false;
 
     if (stroke.points.isEmpty) {
       _flushDeferredInboundOps(notify: false);
@@ -809,8 +1267,7 @@ class NotebookController extends ChangeNotifier {
         'deleted': false,
       },
     );
-    _undoStack.add(pair.undoPatch);
-    _redoStack.clear();
+    _pushUndoGroup(<UndoPatch>[pair.undoPatch]);
 
     _flushDeferredInboundOps(notify: false);
     _bumpCommittedInk();
@@ -834,6 +1291,7 @@ class NotebookController extends ChangeNotifier {
     if (prev == null) return;
     _activeStroke = null;
     _activeStrokePathLength = 0.0;
+    _isActiveStrokeSnappedLine = false;
     _pendingStrokeEndId = prev.strokeId;
     _pendingStrokeEndKind = prev.kind;
     _pendingStrokeEndColor = prev.colorValue;
@@ -1117,7 +1575,7 @@ class NotebookController extends ChangeNotifier {
         current.height == oldHeight) {
       return;
     }
-    _undoStack.add(
+    _pushUndoGroup(<UndoPatch>[
       UndoPatch(
         entityType: EntityType.element,
         entityId: elementId,
@@ -1128,14 +1586,269 @@ class NotebookController extends ChangeNotifier {
           'height': oldHeight,
         },
       ),
-    );
-    _redoStack.clear();
+    ]);
     notifyListeners();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Freehand Lasso Multi-Selection & Group Editing
+  // ---------------------------------------------------------------------------
+
+  void startLasso(Offset scenePos) {
+    _selectedElementId = null;
+    _selectedElementIds.clear();
+    _editingCardId = null;
+    _activeLassoPoints
+      ..clear()
+      ..add(scenePos);
+    _bumpLivePaint();
+  }
+
+  void appendLassoPoint(Offset scenePos) {
+    if (_activeLassoPoints.isEmpty) return;
+    if ((scenePos - _activeLassoPoints.last).distanceSquared < 4.0) return;
+    _activeLassoPoints.add(scenePos);
+    _bumpLivePaint();
+  }
+
+  void finishLasso() {
+    if (_activeLassoPoints.isEmpty) return;
+    final poly = List<Offset>.from(_activeLassoPoints);
+    _activeLassoPoints.clear();
+
+    if (poly.length >= 3) {
+      for (final el in activeElements) {
+        if (elementMatchesLasso(el, poly)) {
+          _selectedElementIds.add(el.id);
+        }
+      }
+    }
+    if (_selectedElementIds.length == 1) {
+      _selectedElementId = _selectedElementIds.first;
+    } else {
+      _selectedElementId = null;
+    }
+    _bumpLivePaint();
+    notifyListeners();
+  }
+
+  void cancelLasso() {
+    if (_activeLassoPoints.isEmpty) return;
+    _activeLassoPoints.clear();
+    _bumpLivePaint();
+  }
+
+  Set<String> _effectiveTargetIds() {
+    if (_selectedElementIds.isNotEmpty) {
+      return Set<String>.from(_selectedElementIds);
+    }
+    if (_selectedElementId != null) {
+      return <String>{_selectedElementId!};
+    }
+    return <String>{};
+  }
+
+  Map<String, Offset> captureSelectedOrigins() {
+    final origins = <String, Offset>{};
+    for (final id in _effectiveTargetIds()) {
+      final el = _doc.getElement(id);
+      if (el != null && !el.deleted && !el.locked) {
+        origins[id] = Offset(el.x, el.y);
+      }
+    }
+    return origins;
+  }
+
+  void previewMoveSelectedElements(
+    Map<String, Offset> origins,
+    Offset totalSceneDelta,
+  ) {
+    if (origins.isEmpty) return;
+    final ops = <CrdtOp>[];
+    for (final entry in origins.entries) {
+      final el = _doc.getElement(entry.key);
+      if (el == null || el.deleted || el.locked) continue;
+      final pair = _doc.mutateEntity(
+        entityType: EntityType.element,
+        entityId: el.id,
+        fields: <String, Object?>{
+          'x': entry.value.dx + totalSceneDelta.dx,
+          'y': entry.value.dy + totalSceneDelta.dy,
+        },
+      );
+      ops.add(pair.forward);
+    }
+    if (ops.isEmpty) return;
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(ops);
+    notifyListeners();
+  }
+
+  void commitGroupMoveUndo(Map<String, Offset> origins) {
+    if (origins.isEmpty) return;
+    final patches = <UndoPatch>[];
+    for (final entry in origins.entries) {
+      final current = _doc.getElement(entry.key);
+      if (current == null) continue;
+      if ((current.x - entry.value.dx).abs() < 0.01 &&
+          (current.y - entry.value.dy).abs() < 0.01) {
+        continue;
+      }
+      patches.add(
+        UndoPatch(
+          entityType: EntityType.element,
+          entityId: entry.key,
+          fields: <String, Object?>{
+            'x': entry.value.dx,
+            'y': entry.value.dy,
+          },
+        ),
+      );
+    }
+    if (patches.isEmpty) return;
+    _pushUndoGroup(patches);
+    notifyListeners();
+  }
+
+  void recolorSelectedElements(Color color) {
+    final ids = _effectiveTargetIds();
+    if (ids.isEmpty) return;
+    final ops = <CrdtOp>[];
+    final undoGroup = <UndoPatch>[];
+    final argb = color.toARGB32();
+    for (final id in ids) {
+      final el = _doc.getElement(id);
+      if (el == null || el.deleted || el.locked) continue;
+      final fields = <String, Object?>{};
+      if (el.kind == ElementKind.stickyNote) {
+        fields['fillColorValue'] = argb;
+        fields['colorValue'] = argb;
+      } else {
+        fields['colorValue'] = argb;
+      }
+      final pair = _doc.mutateEntity(
+        entityType: EntityType.element,
+        entityId: el.id,
+        fields: fields,
+      );
+      ops.add(pair.forward);
+      undoGroup.add(pair.undoPatch);
+    }
+    if (ops.isEmpty) return;
+    _pushUndoGroup(undoGroup);
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(ops);
+    notifyListeners();
+  }
+
+  List<String> duplicateSelectedElements({
+    Offset offset = const Offset(28, 28),
+  }) {
+    final ids = _effectiveTargetIds();
+    if (ids.isEmpty) return const <String>[];
+    final ops = <CrdtOp>[];
+    final undoGroup = <UndoPatch>[];
+    final newIds = <String>[];
+    var z = _doc.nextZIndex(_activePageId);
+
+    for (final id in ids) {
+      final el = _doc.getElement(id);
+      if (el == null || el.deleted) continue;
+      final newId = _newEntityId('el');
+      final pair = _doc.mutateEntity(
+        entityType: EntityType.element,
+        entityId: newId,
+        fields: <String, Object?>{
+          'pageId': _activePageId,
+          'kind': el.kind.name,
+          'shapeKind': el.shapeKind.name,
+          'x': el.x + offset.dx,
+          'y': el.y + offset.dy,
+          'width': el.width,
+          'height': el.height,
+          'colorValue': el.colorValue,
+          'fillColorValue': el.fillColorValue,
+          'strokeWidth': el.strokeWidth,
+          'text': el.text,
+          'imageUri': el.imageUri,
+          'points': el.points.map((p) => p.toCompactJson()).toList(),
+          'zIndex': z++,
+          'locked': false,
+          'authorId': _peerId,
+          'authorName': _displayName,
+          'deleted': false,
+        },
+      );
+      ops.add(pair.forward);
+      undoGroup.add(pair.undoPatch);
+      newIds.add(newId);
+    }
+
+    if (newIds.isEmpty) return const <String>[];
+    _pushUndoGroup(undoGroup);
+    _selectedElementIds
+      ..clear()
+      ..addAll(newIds);
+    _selectedElementId = newIds.length == 1 ? newIds.first : null;
+    _editingCardId = null;
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(ops);
+    notifyListeners();
+    return newIds;
+  }
+
+  void deleteSelectedElements() {
+    final ids = _effectiveTargetIds();
+    if (ids.isEmpty) return;
+    final ops = <CrdtOp>[];
+    final undoGroup = <UndoPatch>[];
+    for (final id in ids) {
+      final el = _doc.getElement(id);
+      if (el == null || el.deleted || el.locked) continue;
+      final pair = _doc.mutateEntity(
+        entityType: EntityType.element,
+        entityId: el.id,
+        fields: <String, Object?>{'deleted': true},
+      );
+      ops.add(pair.forward);
+      undoGroup.add(pair.undoPatch);
+    }
+    if (ops.isEmpty) return;
+    _pushUndoGroup(undoGroup);
+    _selectedElementId = null;
+    _selectedElementIds.clear();
+    _editingCardId = null;
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(ops);
+    notifyListeners();
+  }
+
+  void toggleElementLocked(String elementId) {
+    final el = _doc.getElement(elementId);
+    if (el == null || el.deleted) return;
+    final nextLocked = !el.locked;
+    if (nextLocked) {
+      if (_selectedElementId == elementId) _selectedElementId = null;
+      _selectedElementIds.remove(elementId);
+      if (_editingCardId == elementId) _editingCardId = null;
+    } else {
+      _selectedElementId = elementId;
+    }
+    _commitPatch(
+      EntityType.element,
+      elementId,
+      <String, Object?>{'locked': nextLocked},
+    );
   }
 
   void eraseAt(Offset scenePos) {
     final candidates = activeElements.reversed;
     for (final el in candidates) {
+      if (el.locked) continue;
       if (el.hitTest(scenePos.dx, scenePos.dy, tolerance: 14.0)) {
         deleteElement(el.id);
         break;
@@ -1145,6 +1858,7 @@ class NotebookController extends ChangeNotifier {
 
   CanvasElementModel? hitTestElement(Offset scenePos) {
     for (final el in activeElements.reversed) {
+      if (el.locked) continue;
       if (el.hitTest(scenePos.dx, scenePos.dy, tolerance: 12.0)) {
         return el;
       }
@@ -1156,6 +1870,7 @@ class NotebookController extends ChangeNotifier {
     final el = _doc.getElement(elementId);
     if (el == null || el.deleted) return;
     if (_selectedElementId == elementId) _selectedElementId = null;
+    _selectedElementIds.remove(elementId);
     if (_editingCardId == elementId) _editingCardId = null;
     _commitPatch(
       EntityType.element,
@@ -1167,20 +1882,25 @@ class NotebookController extends ChangeNotifier {
   void clearActivePage() {
     final els = activeElements;
     if (els.isEmpty) return;
+    final unlocked = els.where((e) => !e.locked).toList();
+    final targets = unlocked.isNotEmpty ? unlocked : els;
     final ops = <CrdtOp>[];
-    for (final el in els) {
+    final undoGroup = <UndoPatch>[];
+    for (final el in targets) {
       final pair = _doc.mutateEntity(
         entityType: EntityType.element,
         entityId: el.id,
         fields: <String, Object?>{'deleted': true},
       );
       ops.add(pair.forward);
-      _undoStack.add(pair.undoPatch);
+      undoGroup.add(pair.undoPatch);
     }
-    _redoStack.clear();
+    _pushUndoGroup(undoGroup);
     _selectedElementId = null;
+    _selectedElementIds.clear();
     _editingCardId = null;
     _bumpCommittedInk();
+    _bumpLivePaint();
     _dispatchOps(ops);
     notifyListeners();
   }
@@ -1229,25 +1949,48 @@ class NotebookController extends ChangeNotifier {
     }
   }
 
+  void _pushUndoGroup(List<UndoPatch> patches) {
+    if (patches.isEmpty) return;
+    _undoStack.add(patches);
+    if (_undoStack.length > 120) {
+      _undoStack.removeAt(0);
+    }
+    _redoStack.clear();
+  }
+
   void undo() {
     if (_undoStack.isEmpty) return;
-    final patch = _undoStack.removeLast();
-    final pair = _doc.applyUndoPatch(patch);
-    _redoStack.add(pair.undoPatch);
+    final group = _undoStack.removeLast();
+    final ops = <CrdtOp>[];
+    final redoGroup = <UndoPatch>[];
+    for (final patch in group.reversed) {
+      final pair = _doc.applyUndoPatch(patch);
+      ops.add(pair.forward);
+      redoGroup.add(pair.undoPatch);
+    }
+    _redoStack.add(redoGroup);
     _ensureValidSelection();
     _bumpCommittedInk();
-    _dispatchOps(<CrdtOp>[pair.forward]);
+    _bumpLivePaint();
+    _dispatchOps(ops);
     notifyListeners();
   }
 
   void redo() {
     if (_redoStack.isEmpty) return;
-    final patch = _redoStack.removeLast();
-    final pair = _doc.applyUndoPatch(patch);
-    _undoStack.add(pair.undoPatch);
+    final group = _redoStack.removeLast();
+    final ops = <CrdtOp>[];
+    final undoGroup = <UndoPatch>[];
+    for (final patch in group.reversed) {
+      final pair = _doc.applyUndoPatch(patch);
+      ops.add(pair.forward);
+      undoGroup.add(pair.undoPatch);
+    }
+    _undoStack.add(undoGroup);
     _ensureValidSelection();
     _bumpCommittedInk();
-    _dispatchOps(<CrdtOp>[pair.forward]);
+    _bumpLivePaint();
+    _dispatchOps(ops);
     notifyListeners();
   }
 
@@ -1737,6 +2480,392 @@ class NotebookController extends ChangeNotifier {
     return _platform.saveExportFile(filename, exportRoomJson());
   }
 
+  // ---------------------------------------------------------------------------
+  // Multi-Page PDF Import & High-Res PNG / Markdown Note Export
+  // ---------------------------------------------------------------------------
+
+  /// Imports rendered PDF pages either into the current notebook or into a
+  /// freshly created dedicated notebook. Each PDF page becomes a clean notebook
+  /// page with a locked background sheet (`zIndex: -100`, `locked: true`) so
+  /// users and collaborators can handwrite & highlight freely on top.
+  Future<int> importPdfDocument(
+    PdfImportedDocument pdf, {
+    bool asNewNotebook = false,
+  }) async {
+    if (pdf.pages.isEmpty) return 0;
+
+    final rawName = pdf.fileName.trim();
+    final dotIdx = rawName.lastIndexOf('.');
+    final baseTitle = (dotIdx > 0 ? rawName.substring(0, dotIdx) : rawName)
+        .trim();
+    final cleanTitle = baseTitle.isEmpty ? 'PDF 讲义' : baseTitle;
+
+    final ops = <CrdtOp>[];
+    final undoGroup = <UndoPatch>[];
+    var targetNotebookId = _activeNotebookId;
+
+    if (asNewNotebook) {
+      targetNotebookId = _newEntityId('nb');
+      final nbPair = _doc.mutateEntity(
+        entityType: EntityType.notebook,
+        entityId: targetNotebookId,
+        fields: <String, Object?>{
+          'title': cleanTitle,
+          'colorValue': 0xFF4F46E5,
+          'sortOrder': notebooks.length,
+          'deleted': false,
+        },
+      );
+      ops.add(nbPair.forward);
+      undoGroup.add(nbPair.undoPatch);
+    }
+
+    final existingPages = _doc.pagesForNotebook(targetNotebookId);
+    final baseSort = existingPages.length;
+    const sheetWidth = 794.0;
+    const sheetX = 40.0;
+    const sheetY = 32.0;
+
+    String? firstImportedPageId;
+
+    for (var i = 0; i < pdf.pages.length; i++) {
+      final p = pdf.pages[i];
+      final pageId = _newEntityId('page');
+      firstImportedPageId ??= pageId;
+
+      final aspect = (p.width > 0 && p.height > 0)
+          ? (p.height / p.width)
+          : (842.0 / 595.0);
+      final sheetHeight = (sheetWidth * aspect).clamp(320.0, 2400.0);
+
+      final pagePair = _doc.mutateEntity(
+        entityType: EntityType.page,
+        entityId: pageId,
+        fields: <String, Object?>{
+          'notebookId': targetNotebookId,
+          'title': '$cleanTitle · P${p.pageNumber}',
+          'background': PageBackground.blank.name,
+          'backgroundColorValue': 0xFFF8FAFC,
+          'sortOrder': baseSort + i,
+          'bookmarked': false,
+          'deleted': false,
+        },
+      );
+      ops.add(pagePair.forward);
+      undoGroup.add(pagePair.undoPatch);
+
+      final elId = _newEntityId('el');
+      final elPair = _doc.mutateEntity(
+        entityType: EntityType.element,
+        entityId: elId,
+        fields: <String, Object?>{
+          'pageId': pageId,
+          'kind': ElementKind.image.name,
+          'x': sheetX,
+          'y': sheetY,
+          'width': sheetWidth,
+          'height': sheetHeight,
+          'colorValue': 0xFF0F172A,
+          'fillColorValue': 0xFFFFFFFF,
+          'strokeWidth': 1.0,
+          'text': '',
+          'imageUri': p.dataUrl,
+          'zIndex': -100,
+          'locked': true,
+          'authorId': _peerId,
+          'authorName': _displayName,
+          'deleted': false,
+        },
+      );
+      ops.add(elPair.forward);
+      undoGroup.add(elPair.undoPatch);
+    }
+
+    _pushUndoGroup(undoGroup);
+    if (firstImportedPageId != null) {
+      _activeNotebookId = targetNotebookId;
+      _activePageId = firstImportedPageId;
+      _selectedElementId = null;
+      _selectedElementIds.clear();
+      _editingCardId = null;
+      _panOffset = const Offset(24, 18);
+      if (_viewportSize.height > 200) {
+        final fitZoom = ((_viewportSize.height - 80) / 1180.0).clamp(0.55, 1.0);
+        _zoom = fitZoom;
+      }
+    }
+
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    _dispatchOps(ops);
+    notifyListeners();
+    sendPresence(force: true);
+    return pdf.pages.length;
+  }
+
+  /// Generates a clean Markdown summary of all pages, Markdown cards, sticky
+  /// notes, shape labels, and annotation counts in the active notebook.
+  String exportActiveNotebookMarkdown() {
+    final nb = activeNotebook;
+    final nbTitle = nb?.title ?? 'SyncCanvas 笔记本';
+    final pages = activePages;
+    final buf = StringBuffer()
+      ..writeln('# $nbTitle')
+      ..writeln()
+      ..writeln('> 导出自 SyncCanvas Notebook · 共 ${pages.length} 页')
+      ..writeln();
+
+    for (var i = 0; i < pages.length; i++) {
+      final page = pages[i];
+      final star = page.bookmarked ? ' ⭐' : '';
+      buf.writeln('## ${i + 1}. ${page.title}$star');
+      buf.writeln();
+
+      final els = _doc.elementsForPage(page.id).where((e) => !e.deleted).toList()
+        ..sort((a, b) {
+          final dy = a.y.compareTo(b.y);
+          return dy != 0 ? dy : a.x.compareTo(b.x);
+        });
+
+      var strokeCount = 0;
+      var hlCount = 0;
+      var wroteTextBlock = false;
+
+      for (final el in els) {
+        switch (el.kind) {
+          case ElementKind.textCard:
+            if (el.text.trim().isNotEmpty) {
+              buf.writeln(el.text.trim());
+              buf.writeln();
+              wroteTextBlock = true;
+            }
+            break;
+          case ElementKind.stickyNote:
+            if (el.text.trim().isNotEmpty) {
+              final quoted = el.text
+                  .trim()
+                  .split('\n')
+                  .map((line) => '> $line')
+                  .join('\n');
+              buf.writeln('> 📌 **便签（${el.authorName}）**');
+              buf.writeln(quoted);
+              buf.writeln();
+              wroteTextBlock = true;
+            }
+            break;
+          case ElementKind.shape:
+            if (el.text.trim().isNotEmpty) {
+              buf.writeln('- 🔹 **图形标注**：${el.text.trim()}');
+              wroteTextBlock = true;
+            }
+            break;
+          case ElementKind.image:
+            final imgTitle = el.text.trim().isNotEmpty
+                ? el.text.trim()
+                : (el.locked ? 'PDF 讲义页底图' : '插图卡片');
+            buf.writeln('- 🖼️ **$imgTitle**');
+            wroteTextBlock = true;
+            break;
+          case ElementKind.stroke:
+            strokeCount += 1;
+            break;
+          case ElementKind.highlighter:
+            hlCount += 1;
+            break;
+        }
+      }
+
+      if (strokeCount > 0 || hlCount > 0) {
+        buf.writeln('- ✍️ 手写笔迹 $strokeCount 笔 · 荧光批注 $hlCount 处');
+        buf.writeln();
+      } else if (!wroteTextBlock) {
+        buf.writeln('_（空白画板页）_');
+        buf.writeln();
+      }
+    }
+
+    return buf.toString();
+  }
+
+  Future<String?> saveActiveNotebookMarkdown() {
+    final raw = (activeNotebook?.title ?? 'notebook').trim();
+    final safe = raw.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    final filename = '${safe.isEmpty ? 'notebook' : safe}.md';
+    return _platform.saveExportFile(filename, exportActiveNotebookMarkdown());
+  }
+
+  /// Renders the active page (paper template + PDF/image cards + sticky/text
+  /// cards + highlighters + variable-width ink strokes + shapes) to PNG bytes.
+  Future<Uint8List?> renderActivePagePngBytes({double pixelRatio = 2.0}) async {
+    final page = activePage;
+    if (page == null) return null;
+    final els = activeElements;
+
+    var sceneRect = const Rect.fromLTWH(0, 0, 874, 1180);
+    for (final el in els) {
+      if (el.deleted) continue;
+      final rawB = el.bounds;
+      final r = Rect.fromLTRB(rawB.left, rawB.top, rawB.right, rawB.bottom);
+      sceneRect = sceneRect.expandToInclude(r.inflate(28.0));
+    }
+    final clampedW = sceneRect.width.clamp(640.0, 2400.0);
+    final clampedH = sceneRect.height.clamp(480.0, 3400.0);
+    final exportScene = Rect.fromLTWH(
+      sceneRect.left,
+      sceneRect.top,
+      clampedW,
+      clampedH,
+    );
+
+    final effectiveScale = math.min(
+      pixelRatio.clamp(1.0, 3.0),
+      math.min(3600.0 / exportScene.width, 4800.0 / exportScene.height),
+    );
+    final outW = math.max(1, (exportScene.width * effectiveScale).round());
+    final outH = math.max(1, (exportScene.height * effectiveScale).round());
+    final outSize = Size(outW.toDouble(), outH.toDouble());
+    final exportPan = Offset(
+      -exportScene.left * effectiveScale,
+      -exportScene.top * effectiveScale,
+    );
+
+    final decodedImages = <String, ui.Image>{};
+    for (final el in els) {
+      if (el.deleted || el.kind != ElementKind.image) continue;
+      final uri = el.imageUri.trim();
+      if (!uri.startsWith('data:image/')) continue;
+      final comma = uri.indexOf(',');
+      if (comma < 0) continue;
+      try {
+        final rawBytes = base64Decode(uri.substring(comma + 1));
+        final codec = await ui.instantiateImageCodec(rawBytes);
+        final frame = await codec.getNextFrame();
+        decodedImages[el.id] = frame.image;
+      } catch (_) {}
+    }
+
+    try {
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder, Offset.zero & outSize);
+
+      // 1. Paper & template
+      CommittedCanvasPainter(
+        page: page,
+        elements: const <CanvasElementModel>[],
+        panOffset: exportPan,
+        zoom: effectiveScale,
+        selectedElementId: null,
+        showPageGuide: false,
+        paintPaper: true,
+        paintInk: false,
+      ).paint(canvas, outSize);
+
+      // 2. Cards (PDF sheets, images, sticky notes, Markdown cards) below ink
+      canvas.save();
+      canvas.translate(exportPan.dx, exportPan.dy);
+      canvas.scale(effectiveScale, effectiveScale);
+      for (final el in els) {
+        if (el.deleted) continue;
+        if (el.kind != ElementKind.image &&
+            el.kind != ElementKind.stickyNote &&
+            el.kind != ElementKind.textCard) {
+          continue;
+        }
+        final cardRect = Rect.fromLTWH(el.x, el.y, el.width, el.height);
+        final isFullBleedPdf =
+            el.kind == ElementKind.image && el.locked && el.text.trim().isEmpty;
+        final radius = Radius.circular(
+          isFullBleedPdf ? 2 : (el.kind == ElementKind.stickyNote ? 6 : 12),
+        );
+        final rrect = RRect.fromRectAndRadius(cardRect, radius);
+        final bg = el.fillColorValue != 0
+            ? Color(el.fillColorValue)
+            : (el.kind == ElementKind.stickyNote
+                ? const Color(0xFFFEF08A)
+                : Colors.white);
+        canvas.drawRRect(rrect, Paint()..color = bg);
+
+        if (el.kind == ElementKind.image) {
+          final img = decodedImages[el.id];
+          if (img != null) {
+            final imgRect =
+                isFullBleedPdf ? cardRect : cardRect.deflate(6.0);
+            paintImage(
+              canvas: canvas,
+              rect: imgRect,
+              image: img,
+              fit: BoxFit.contain,
+              filterQuality: FilterQuality.medium,
+            );
+          }
+        } else if (el.text.trim().isNotEmpty) {
+          final clean = el.text
+              .replaceAll(RegExp(r'^#{1,3}\s+', multiLine: true), '')
+              .replaceAll('**', '');
+          final tp = TextPainter(
+            text: TextSpan(
+              text: clean,
+              style: const TextStyle(
+                color: Color(0xFF0F172A),
+                fontSize: 13.5,
+                height: 1.45,
+              ),
+            ),
+            textDirection: TextDirection.ltr,
+          )..layout(maxWidth: math.max(40.0, el.width - 28.0));
+          canvas.save();
+          canvas.clipRRect(rrect);
+          tp.paint(canvas, Offset(el.x + 14.0, el.y + 14.0));
+          canvas.restore();
+        }
+
+        if (!isFullBleedPdf) {
+          canvas.drawRRect(
+            rrect,
+            Paint()
+              ..color = const Color(0xFFCBD5E1)
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 1.0,
+          );
+        }
+      }
+      canvas.restore();
+
+      // 3. Vector strokes, highlighters & shapes on top
+      CommittedCanvasPainter(
+        page: page,
+        elements: els,
+        panOffset: exportPan,
+        zoom: effectiveScale,
+        selectedElementId: null,
+        showPageGuide: false,
+        paintPaper: false,
+        paintInk: true,
+      ).paint(canvas, outSize);
+
+      final picture = recorder.endRecording();
+      final rendered = await picture.toImage(outW, outH);
+      final byteData =
+          await rendered.toByteData(format: ui.ImageByteFormat.png);
+      rendered.dispose();
+      picture.dispose();
+      return byteData?.buffer.asUint8List();
+    } finally {
+      for (final img in decodedImages.values) {
+        img.dispose();
+      }
+    }
+  }
+
+  Future<String?> exportActivePagePng() async {
+    final bytes = await renderActivePagePngBytes(pixelRatio: 2.0);
+    if (bytes == null || bytes.isEmpty) return null;
+    final raw = (activePage?.title ?? 'page').trim();
+    final safe = raw.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    final filename = '${safe.isEmpty ? 'page' : safe}.png';
+    return _platform.saveExportBytes(filename, bytes, mimeType: 'image/png');
+  }
+
   Future<bool> importRoomJson(String rawJson) async {
     try {
       final decoded = jsonDecode(rawJson) as Map<String, dynamic>;
@@ -2020,8 +3149,7 @@ class NotebookController extends ChangeNotifier {
       fields: fields,
     );
     if (recordUndo) {
-      _undoStack.add(pair.undoPatch);
-      _redoStack.clear();
+      _pushUndoGroup(<UndoPatch>[pair.undoPatch]);
     }
     _bumpCommittedInk();
     _dispatchOps(<CrdtOp>[pair.forward]);
@@ -2249,6 +3377,12 @@ class NotebookController extends ChangeNotifier {
         _editingCardId = null;
       }
     }
+    if (_selectedElementIds.isNotEmpty) {
+      _selectedElementIds.removeWhere((id) {
+        final el = _doc.getElement(id);
+        return el == null || el.deleted || el.pageId != _activePageId;
+      });
+    }
   }
 
   Offset _screenCenterInScene() {
@@ -2285,6 +3419,20 @@ class NotebookController extends ChangeNotifier {
             savedRoom != null &&
             savedRoom.isNotEmpty) {
           _roomId = savedRoom;
+        }
+        final savedGuide = meta['showPageGuide'] as bool?;
+        if (savedGuide != null) {
+          _showPageGuide = savedGuide;
+        }
+        final savedPresets = meta['penPresets'] as List<dynamic>?;
+        if (savedPresets != null && savedPresets.length == _penPresets.length) {
+          for (var i = 0; i < _penPresets.length; i++) {
+            final item = savedPresets[i];
+            if (item is Map) {
+              _penPresets[i] =
+                  PenPreset.fromJson(Map<String, dynamic>.from(item));
+            }
+          }
         }
       } catch (_) {}
     }
@@ -2333,6 +3481,8 @@ class NotebookController extends ChangeNotifier {
         'avatarColorValue': _avatarColorValue,
         'wsUrl': _wsUrl,
         'roomId': _roomId,
+        'showPageGuide': _showPageGuide,
+        'penPresets': _penPresets.map((p) => p.toJson()).toList(),
       }),
     );
     final unsentOps = <CrdtOp>[..._pendingOps, ..._outboundOpQueue];

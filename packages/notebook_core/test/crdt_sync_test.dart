@@ -221,6 +221,37 @@ void main() {
       final arrow = b.getElement('el-seed-arrow-2')!;
       expect(arrow.bounds.left, lessThan(arrow.bounds.right));
       expect(arrow.hitTest(580, 458), isTrue);
+
+      // Verify page bookmark, mistakeBook/weeklyPlan templates, and element locked sync
+      final pagePair = a.mutateEntity(
+        entityType: EntityType.page,
+        entityId: 'page-pdf-test',
+        nowMs: 50100,
+        fields: <String, Object?>{
+          'notebookId': 'nb-welcome',
+          'title': '高数讲义 · P1',
+          'background': PageBackground.mistakeBook.name,
+          'bookmarked': true,
+          'deleted': false,
+        },
+      );
+      final lockedElPair = a.mutateEntity(
+        entityType: EntityType.element,
+        entityId: 'el-pdf-sheet',
+        nowMs: 50110,
+        fields: <String, Object?>{
+          'pageId': 'page-pdf-test',
+          'kind': ElementKind.image.name,
+          'locked': true,
+          'zIndex': -100,
+          'deleted': false,
+        },
+      );
+      b.applyOps(<CrdtOp>[pagePair.forward, lockedElPair.forward]);
+      expect(b.getPage('page-pdf-test')!.bookmarked, isTrue);
+      expect(b.getPage('page-pdf-test')!.background, PageBackground.mistakeBook);
+      expect(b.getElement('el-pdf-sheet')!.locked, isTrue);
+      expect(b.deepDigest(), a.deepDigest());
     });
   });
 

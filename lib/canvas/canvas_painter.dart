@@ -56,6 +56,7 @@ class CommittedCanvasPainter extends CustomPainter {
     required this.zoom,
     required this.selectedElementId,
     this.revision = 0,
+    this.showPageGuide = false,
     this.paintPaper = true,
     this.paintInk = true,
   });
@@ -66,14 +67,15 @@ class CommittedCanvasPainter extends CustomPainter {
   final double zoom;
   final String? selectedElementId;
   final int revision;
+  final bool showPageGuide;
   final bool paintPaper;
   final bool paintInk;
 
   @override
   void paint(Canvas canvas, Size size) {
+    final paperColor = Color(page?.backgroundColorValue ?? 0xFFFFFDF9);
+    final isDarkPaper = paperColor.computeLuminance() < 0.35;
     if (paintPaper) {
-      final paperColor =
-          Color(page?.backgroundColorValue ?? 0xFFFFFDF9);
       canvas.drawRect(Offset.zero & size, Paint()..color = paperColor);
     }
 
@@ -93,7 +95,12 @@ class CommittedCanvasPainter extends CustomPainter {
         canvas,
         visibleWorld,
         page?.background ?? PageBackground.grid,
+        isDarkPaper: isDarkPaper,
       );
+
+      if (showPageGuide) {
+        _paintA4PageGuide(canvas, visibleWorld, isDarkPaper: isDarkPaper);
+      }
     }
 
     if (paintInk) {
@@ -119,8 +126,16 @@ class CommittedCanvasPainter extends CustomPainter {
   void _paintPaperTemplate(
     Canvas canvas,
     Rect visible,
-    PageBackground background,
-  ) {
+    PageBackground background, {
+    bool isDarkPaper = false,
+  }) {
+    final subtleLineColor = isDarkPaper
+        ? Colors.white.withValues(alpha: 0.12)
+        : const Color(0xFFE2E8F0).withValues(alpha: 0.72);
+    final accentColor = isDarkPaper
+        ? const Color(0xFFA5B4FC).withValues(alpha: 0.65)
+        : const Color(0xFF6366F1).withValues(alpha: 0.55);
+
     switch (background) {
       case PageBackground.blank:
         return;
@@ -128,7 +143,7 @@ class CommittedCanvasPainter extends CustomPainter {
       case PageBackground.grid:
         const step = 32.0;
         final paint = Paint()
-          ..color = const Color(0xFFE2E8F0).withValues(alpha: 0.72)
+          ..color = subtleLineColor
           ..strokeWidth = 1.0 / math.max(0.6, zoom);
         final startX = (visible.left / step).floor() * step;
         final startY = (visible.top / step).floor() * step;
@@ -151,7 +166,9 @@ class CommittedCanvasPainter extends CustomPainter {
       case PageBackground.dots:
         const step = 28.0;
         final paint = Paint()
-          ..color = const Color(0xFFCBD5E1).withValues(alpha: 0.9)
+          ..color = isDarkPaper
+              ? Colors.white.withValues(alpha: 0.24)
+              : const Color(0xFFCBD5E1).withValues(alpha: 0.9)
           ..style = PaintingStyle.fill;
         final radius = 1.4 / math.max(0.6, zoom);
         final startX = (visible.left / step).floor() * step;
@@ -166,7 +183,9 @@ class CommittedCanvasPainter extends CustomPainter {
       case PageBackground.ruled:
         const lineStep = 36.0;
         final rulePaint = Paint()
-          ..color = const Color(0xFFBFDBFE).withValues(alpha: 0.75)
+          ..color = isDarkPaper
+              ? Colors.white.withValues(alpha: 0.16)
+              : const Color(0xFFBFDBFE).withValues(alpha: 0.75)
           ..strokeWidth = 1.1 / math.max(0.6, zoom);
         final startY = (visible.top / lineStep).floor() * lineStep;
         for (var y = startY; y <= visible.bottom; y += lineStep) {
@@ -177,7 +196,9 @@ class CommittedCanvasPainter extends CustomPainter {
           );
         }
         final marginPaint = Paint()
-          ..color = const Color(0xFFFCA5A5).withValues(alpha: 0.75)
+          ..color = isDarkPaper
+              ? const Color(0xFFFCA5A5).withValues(alpha: 0.45)
+              : const Color(0xFFFCA5A5).withValues(alpha: 0.75)
           ..strokeWidth = 1.5 / math.max(0.6, zoom);
         canvas.drawLine(
           Offset(88, visible.top),
@@ -189,9 +210,10 @@ class CommittedCanvasPainter extends CustomPainter {
       case PageBackground.cornell:
         const lineStep = 34.0;
         final rulePaint = Paint()
-          ..color = const Color(0xFFE2E8F0).withValues(alpha: 0.75)
+          ..color = subtleLineColor
           ..strokeWidth = 1.0 / math.max(0.6, zoom);
-        final startY = math.max(120.0, (visible.top / lineStep).floor() * lineStep);
+        final startY =
+            math.max(120.0, (visible.top / lineStep).floor() * lineStep);
         for (var y = startY; y <= visible.bottom; y += lineStep) {
           canvas.drawLine(
             Offset(visible.left, y),
@@ -200,43 +222,283 @@ class CommittedCanvasPainter extends CustomPainter {
           );
         }
         final dividerPaint = Paint()
-          ..color = const Color(0xFF6366F1).withValues(alpha: 0.45)
+          ..color = accentColor
           ..strokeWidth = 2.0 / math.max(0.6, zoom);
-        // Header horizontal bar
         canvas.drawLine(
           Offset(visible.left, 110),
           Offset(visible.right, 110),
           dividerPaint,
         );
-        // Cue vertical divider
         canvas.drawLine(
           Offset(268, 110),
           Offset(268, math.max(552, visible.bottom)),
           dividerPaint,
         );
-        // Summary horizontal divider
         canvas.drawLine(
           Offset(visible.left, 552),
           Offset(visible.right, 552),
           dividerPaint,
         );
-        _paintCornellBadge(canvas, '主题 / Topic', const Offset(36, 74));
-        _paintCornellBadge(canvas, '线索 / Cues', const Offset(36, 120));
-        _paintCornellBadge(canvas, '笔记 / Notes', const Offset(286, 120));
-        _paintCornellBadge(canvas, '总结 / Summary', const Offset(36, 560));
+        _paintTemplateBadge(
+          canvas,
+          '主题 / Topic',
+          const Offset(36, 74),
+          color: accentColor,
+        );
+        _paintTemplateBadge(
+          canvas,
+          '线索 / Cues',
+          const Offset(36, 120),
+          color: accentColor,
+        );
+        _paintTemplateBadge(
+          canvas,
+          '笔记 / Notes',
+          const Offset(286, 120),
+          color: accentColor,
+        );
+        _paintTemplateBadge(
+          canvas,
+          '总结 / Summary',
+          const Offset(36, 560),
+          color: accentColor,
+        );
+        return;
+
+      case PageBackground.mistakeBook:
+        const gridStep = 32.0;
+        final gridPaint = Paint()
+          ..color = subtleLineColor
+          ..strokeWidth = 0.9 / math.max(0.6, zoom);
+        final startX = (visible.left / gridStep).floor() * gridStep;
+        final startY =
+            math.max(96.0, (visible.top / gridStep).floor() * gridStep);
+        for (var x = startX; x <= visible.right; x += gridStep) {
+          canvas.drawLine(
+            Offset(x, math.max(96.0, visible.top)),
+            Offset(x, visible.bottom),
+            gridPaint,
+          );
+        }
+        for (var y = startY; y <= visible.bottom; y += gridStep) {
+          canvas.drawLine(
+            Offset(visible.left, y),
+            Offset(visible.right, y),
+            gridPaint,
+          );
+        }
+
+        final framePaint = Paint()
+          ..color = isDarkPaper
+              ? const Color(0xFFFCA5A5).withValues(alpha: 0.55)
+              : const Color(0xFFDC2626).withValues(alpha: 0.38)
+          ..strokeWidth = 1.8 / math.max(0.6, zoom);
+        canvas.drawLine(
+          Offset(visible.left, 96),
+          Offset(visible.right, 96),
+          framePaint,
+        );
+        canvas.drawLine(
+          const Offset(438, 96),
+          Offset(438, math.max(920, visible.bottom)),
+          framePaint,
+        );
+        canvas.drawLine(
+          Offset(visible.left, 920),
+          Offset(visible.right, 920),
+          framePaint,
+        );
+        final labelColor = isDarkPaper
+            ? const Color(0xFFFCA5A5).withValues(alpha: 0.85)
+            : const Color(0xFFB91C1C).withValues(alpha: 0.75);
+        _paintTemplateBadge(
+          canvas,
+          '科目 / 章节 · 错题复盘页',
+          const Offset(42, 62),
+          color: labelColor,
+        );
+        _paintTemplateBadge(
+          canvas,
+          '原题摘录 & 错因诊断',
+          const Offset(42, 108),
+          color: labelColor,
+        );
+        _paintTemplateBadge(
+          canvas,
+          '规范解法 & 关键步骤',
+          const Offset(454, 108),
+          color: isDarkPaper
+              ? const Color(0xFF6EE7B7).withValues(alpha: 0.85)
+              : const Color(0xFF047857).withValues(alpha: 0.78),
+        );
+        _paintTemplateBadge(
+          canvas,
+          '同类变式 & 核心避坑总结',
+          const Offset(42, 932),
+          color: accentColor,
+        );
+        return;
+
+      case PageBackground.weeklyPlan:
+        const ruleStep = 36.0;
+        final rulePaint = Paint()
+          ..color = subtleLineColor
+          ..strokeWidth = 1.0 / math.max(0.6, zoom);
+        final startY =
+            math.max(96.0, (visible.top / ruleStep).floor() * ruleStep);
+        for (var y = startY; y <= visible.bottom; y += ruleStep) {
+          canvas.drawLine(
+            Offset(visible.left, y),
+            Offset(visible.right, y),
+            rulePaint,
+          );
+        }
+        final dividerPaint = Paint()
+          ..color = isDarkPaper
+              ? const Color(0xFF5EEAD4).withValues(alpha: 0.55)
+              : const Color(0xFF0D9488).withValues(alpha: 0.45)
+          ..strokeWidth = 1.8 / math.max(0.6, zoom);
+        canvas.drawLine(
+          Offset(visible.left, 96),
+          Offset(visible.right, 96),
+          dividerPaint,
+        );
+        canvas.drawLine(
+          const Offset(540, 96),
+          Offset(540, math.max(1048, visible.bottom)),
+          dividerPaint,
+        );
+        const days = <String>[
+          '周一 Mon',
+          '周二 Tue',
+          '周三 Wed',
+          '周四 Thu',
+          '周五 Fri',
+          '周六 Sat',
+          '周日 Sun',
+        ];
+        final tealText = isDarkPaper
+            ? const Color(0xFF5EEAD4).withValues(alpha: 0.85)
+            : const Color(0xFF0F766E).withValues(alpha: 0.8);
+        _paintTemplateBadge(
+          canvas,
+          '周计划与重点待办 · Weekly Planner',
+          const Offset(42, 62),
+          color: tealText,
+        );
+        _paintTemplateBadge(
+          canvas,
+          '本周核心目标 / 待办清单',
+          const Offset(558, 108),
+          color: tealText,
+        );
+        for (var i = 0; i < days.length; i++) {
+          final slotTop = 96.0 + i * 136.0;
+          if (i > 0) {
+            canvas.drawLine(
+              Offset(40, slotTop),
+              Offset(540, slotTop),
+              dividerPaint,
+            );
+          }
+          _paintTemplateBadge(
+            canvas,
+            days[i],
+            Offset(44, slotTop + 10),
+            color: tealText,
+          );
+        }
         return;
     }
   }
 
-  void _paintCornellBadge(Canvas canvas, String text, Offset pos) {
+  void _paintA4PageGuide(
+    Canvas canvas,
+    Rect visible, {
+    required bool isDarkPaper,
+  }) {
+    const pageLeft = 40.0;
+    const pageRight = 834.0; // 794px standard A4 width at 96 DPI
+    const pageHeight = 1123.0;
+    const topOrigin = 32.0;
+
+    final guideColor = isDarkPaper
+        ? Colors.white.withValues(alpha: 0.18)
+        : const Color(0xFF94A3B8).withValues(alpha: 0.45);
+    final guidePaint = Paint()
+      ..color = guideColor
+      ..strokeWidth = 1.1 / math.max(0.6, zoom);
+
+    _drawDashedLine(
+      canvas,
+      Offset(pageLeft, math.max(topOrigin, visible.top)),
+      Offset(pageLeft, math.max(topOrigin + pageHeight, visible.bottom)),
+      guidePaint,
+    );
+    _drawDashedLine(
+      canvas,
+      Offset(pageRight, math.max(topOrigin, visible.top)),
+      Offset(pageRight, math.max(topOrigin + pageHeight, visible.bottom)),
+      guidePaint,
+    );
+
+    final firstIdx = math.max(0, ((visible.top - topOrigin) / pageHeight).floor());
+    final lastIdx =
+        math.max(1, ((visible.bottom - topOrigin) / pageHeight).ceil());
+    for (var idx = firstIdx; idx <= lastIdx; idx++) {
+      final y = topOrigin + idx * pageHeight;
+      _drawDashedLine(
+        canvas,
+        Offset(pageLeft, y),
+        Offset(pageRight, y),
+        guidePaint,
+      );
+      if (idx >= 0 && idx < 30) {
+        _paintTemplateBadge(
+          canvas,
+          'A4 · 第 ${idx + 1} 屏参考界',
+          Offset(pageRight - 118, y + 6),
+          color: guideColor,
+          fontSize: 10.5,
+        );
+      }
+    }
+  }
+
+  void _drawDashedLine(
+    Canvas canvas,
+    Offset start,
+    Offset end,
+    Paint paint, {
+    double dashLen = 8.0,
+    double gapLen = 6.0,
+  }) {
+    final total = (end - start).distance;
+    if (total <= 0.1) return;
+    final dir = (end - start) / total;
+    var dist = 0.0;
+    while (dist < total) {
+      final segEnd = math.min(total, dist + dashLen);
+      canvas.drawLine(start + dir * dist, start + dir * segEnd, paint);
+      dist += dashLen + gapLen;
+    }
+  }
+
+  void _paintTemplateBadge(
+    Canvas canvas,
+    String text,
+    Offset pos, {
+    required Color color,
+    double fontSize = 12,
+  }) {
     final tp = TextPainter(
       text: TextSpan(
         text: text,
         style: TextStyle(
-          color: const Color(0xFF6366F1).withValues(alpha: 0.65),
-          fontSize: 12,
+          color: color,
+          fontSize: fontSize,
           fontWeight: FontWeight.w600,
-          letterSpacing: 0.4,
+          letterSpacing: 0.3,
         ),
       ),
       textDirection: TextDirection.ltr,
@@ -325,7 +587,8 @@ class CommittedCanvasPainter extends CustomPainter {
     if (paintPaper) {
       if (page?.id != oldDelegate.page?.id ||
           page?.background != oldDelegate.page?.background ||
-          page?.backgroundColorValue != oldDelegate.page?.backgroundColorValue) {
+          page?.backgroundColorValue != oldDelegate.page?.backgroundColorValue ||
+          showPageGuide != oldDelegate.showPageGuide) {
         return true;
       }
     }
@@ -501,6 +764,69 @@ class LiveOverlayPainter extends CustomPainter {
             ..isAntiAlias = true,
         );
       }
+      if (controller.isActiveStrokeSnappedLine && local.points.length >= 2) {
+        final pStart = Offset(local.points.first.dx, local.points.first.dy);
+        final pEnd = Offset(local.points.last.dx, local.points.last.dy);
+        final ringPaint = Paint()
+          ..color = const Color(0xFF4F46E5)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.8 / zoom;
+        final fillDot = Paint()..color = Colors.white;
+        for (final pt in <Offset>[pStart, pEnd]) {
+          canvas.drawCircle(pt, 5.0 / zoom, fillDot);
+          canvas.drawCircle(pt, 5.0 / zoom, ringPaint);
+        }
+      }
+    }
+
+    // 1b. Freehand lasso loop & multi-selection group frame
+    final lassoPts = controller.activeLassoPoints;
+    if (lassoPts.length >= 2) {
+      final polyPath = Path()..moveTo(lassoPts.first.dx, lassoPts.first.dy);
+      for (var i = 1; i < lassoPts.length; i++) {
+        polyPath.lineTo(lassoPts[i].dx, lassoPts[i].dy);
+      }
+      polyPath.close();
+      canvas.drawPath(
+        polyPath,
+        Paint()
+          ..color = const Color(0xFF4F46E5).withValues(alpha: 0.09)
+          ..style = PaintingStyle.fill,
+      );
+      canvas.drawPath(
+        polyPath,
+        Paint()
+          ..color = const Color(0xFF4F46E5)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.8 / zoom
+          ..strokeJoin = StrokeJoin.round,
+      );
+    }
+
+    final groupBounds = controller.selectionBounds;
+    if (groupBounds != null && controller.selectedElementIds.length > 1) {
+      final padded = groupBounds.inflate(8.0);
+      final rrect = RRect.fromRectAndRadius(padded, Radius.circular(8.0 / zoom));
+      canvas.drawRRect(
+        rrect,
+        Paint()
+          ..color = const Color(0xFF4F46E5).withValues(alpha: 0.05)
+          ..style = PaintingStyle.fill,
+      );
+      canvas.drawRRect(
+        rrect,
+        Paint()
+          ..color = const Color(0xFF4F46E5)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.8 / zoom,
+      );
+      _paintPeerTag(
+        canvas,
+        Offset(padded.left, padded.top - 26.0 / zoom),
+        '已套索选中 ${controller.selectedElementIds.length} 项 · 拖动整体平移',
+        const Color(0xFF4F46E5),
+        zoom,
+      );
     }
 
     // 2. Active local shape preview

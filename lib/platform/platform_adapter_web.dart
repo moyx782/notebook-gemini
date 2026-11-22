@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:js_interop';
+import 'dart:typed_data';
 
 import 'package:notebook_core/notebook_core.dart';
 
@@ -9,6 +10,8 @@ export 'platform_adapter_stub.dart'
         HotspotStartOutcome,
         HttpResponseData,
         OperationOutcome,
+        PdfImportedDocument,
+        PdfRenderedPage,
         PlatformAdapter;
 
 @JS('window.localStorage')
@@ -16,6 +19,9 @@ external _DomStorage? get _localStorage;
 
 @JS('window.fetch')
 external JSPromise<_FetchResponse> _jsFetch(String url, [JSAny? init]);
+
+@JS('window.syncCanvasPickPdf')
+external JSPromise<JSString?> _jsPickPdf(int maxPages);
 
 @JS('document.createElement')
 external _DomElement _createElement(String tagName);
@@ -31,7 +37,7 @@ external void _revokeObjectUrl(String url);
 
 @JS('Blob')
 extension type _JsBlob._(JSObject _) implements JSObject {
-  external factory _JsBlob(JSArray<JSString> parts, [JSAny? options]);
+  external factory _JsBlob(JSArray<JSAny> parts, [JSAny? options]);
 }
 
 extension type _DomStorage(JSObject _) implements JSObject {
@@ -82,6 +88,9 @@ class WebPlatformAdapter implements PlatformAdapter {
 
   @override
   bool get canPickImage => true;
+
+  @override
+  bool get canImportPdf => true;
 
   @override
   bool get canScanQrCode => false;
@@ -228,6 +237,22 @@ class WebPlatformAdapter implements PlatformAdapter {
   }
 
   @override
+  Future<PdfImportedDocument?> pickAndRenderPdf({int maxPages = 30}) async {
+    try {
+      final rawJs = await _jsPickPdf(maxPages).toDart;
+      if (rawJs == null) return null;
+      return parsePdfImportJson(rawJs.toDart);
+    } catch (e) {
+      return PdfImportedDocument(
+        fileName: 'document.pdf',
+        totalPages: 0,
+        pages: const <PdfRenderedPage>[],
+        error: e.toString(),
+      );
+    }
+  }
+
+  @override
   Future<String?> scanQrCode() async => null;
 
   @override
@@ -237,8 +262,34 @@ class WebPlatformAdapter implements PlatformAdapter {
   Future<String?> saveExportFile(String filename, String content) async {
     try {
       final blob = _JsBlob(
-        <JSString>[content.toJS].toJS,
-        <String, String>{'type': 'application/json;charset=utf-8'}.jsify(),
+        <JSAny>[content.toJS].toJS,
+        <String, String>{'type': 'text/plain;charset=utf-8'}.jsify(),
+      );
+      final url = _createObjectUrl(blob);
+      final anchor = _createElement('a');
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.style.display = 'none';
+      _documentBody?.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      _revokeObjectUrl(url);
+      return filename;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  Future<String?> saveExportBytes(
+    String filename,
+    Uint8List bytes, {
+    String mimeType = 'image/png',
+  }) async {
+    try {
+      final blob = _JsBlob(
+        <JSAny>[bytes.toJS].toJS,
+        <String, String>{'type': mimeType}.jsify(),
       );
       final url = _createObjectUrl(blob);
       final anchor = _createElement('a');

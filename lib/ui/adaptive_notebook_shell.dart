@@ -87,8 +87,19 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
       return KeyEventResult.handled;
     }
 
+    if (isCmdOrCtrl && event.logicalKey == LogicalKeyboardKey.keyD) {
+      if (c.selectedElementIds.isNotEmpty || c.selectedElementId != null) {
+        c.duplicateSelectedElements();
+        return KeyEventResult.handled;
+      }
+    }
+
     if (event.logicalKey == LogicalKeyboardKey.delete ||
         event.logicalKey == LogicalKeyboardKey.backspace) {
+      if (c.selectedElementIds.isNotEmpty) {
+        c.deleteSelectedElements();
+        return KeyEventResult.handled;
+      }
       if (c.selectedElementId != null) {
         c.deleteElement(c.selectedElementId!);
         return KeyEventResult.handled;
@@ -96,8 +107,7 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
     }
 
     if (event.logicalKey == LogicalKeyboardKey.escape) {
-      c.selectElement(null);
-      c.setEditingCard(null);
+      c.clearSelection();
       return KeyEventResult.handled;
     }
 
@@ -106,6 +116,17 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
     switch (event.logicalKey) {
       case LogicalKeyboardKey.keyV:
         c.setTool(CanvasTool.select);
+        return KeyEventResult.handled;
+      case LogicalKeyboardKey.keyG:
+        c.setTool(CanvasTool.lasso);
+        return KeyEventResult.handled;
+      case LogicalKeyboardKey.pageUp:
+      case LogicalKeyboardKey.bracketLeft:
+        c.goToPrevPage();
+        return KeyEventResult.handled;
+      case LogicalKeyboardKey.pageDown:
+      case LogicalKeyboardKey.bracketRight:
+        c.goToNextPage();
         return KeyEventResult.handled;
       case LogicalKeyboardKey.keyP:
         c.setTool(CanvasTool.pen);
@@ -205,6 +226,42 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
     if (ok == true) {
       widget.controller.clearActivePage();
     }
+  }
+
+  Future<void> _exportCurrentPagePng() async {
+    final saved = await widget.controller.exportActivePagePng();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 82),
+        content: Text(
+          saved == null
+              ? '导出 PNG 失败'
+              : (saved == 'browser-download'
+                  ? '已触发当前画板页高清 PNG 下载'
+                  : '已导出当前页高清 PNG：$saved'),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _exportNotebookMarkdown() async {
+    final saved = await widget.controller.saveActiveNotebookMarkdown();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 82),
+        content: Text(
+          saved == null
+              ? '导出 Markdown 失败'
+              : (saved == 'browser-download'
+                  ? '已触发整本笔记 Markdown (.md) 下载'
+                  : '已导出整本笔记 Markdown：$saved'),
+        ),
+      ),
+    );
   }
 
   @override
@@ -328,6 +385,21 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
                                       ),
                                     ),
 
+                                  // Floating Lasso Selection Action Bar
+                                  if (c.selectedElementIds.length > 1 ||
+                                      (c.tool == CanvasTool.lasso &&
+                                          c.selectedElementIds.isNotEmpty))
+                                    Positioned(
+                                      left: 12,
+                                      right: 12,
+                                      bottom: mode == _ShellMode.phone ? 68 : 78,
+                                      child: Center(
+                                        child: LassoSelectionActionBar(
+                                          controller: c,
+                                        ),
+                                      ),
+                                    ),
+
                                   // Floating bottom toolbar
                                   Positioned(
                                     left: 10,
@@ -339,6 +411,8 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
                                         compact: mode == _ShellMode.phone,
                                         onInsertImage: () =>
                                             showInsertImageDialog(context, c),
+                                        onImportPdf: () =>
+                                            showImportPdfDialog(context, c),
                                       ),
                                     ),
                                   ),
@@ -539,9 +613,82 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
                     ),
                   ),
                 ),
-                const SizedBox(width: 4),
+                if (c.activePage != null)
+                  IconButton(
+                    tooltip: c.activePage!.bookmarked ? '取消本页星标' : '星标收藏本页',
+                    visualDensity: VisualDensity.compact,
+                    constraints:
+                        const BoxConstraints(minWidth: 32, minHeight: 32),
+                    onPressed: () => c.togglePageBookmark(c.activePage!.id),
+                    icon: Icon(
+                      c.activePage!.bookmarked
+                          ? Icons.star_rounded
+                          : Icons.star_border_rounded,
+                      size: 19,
+                      color: c.activePage!.bookmarked
+                          ? const Color(0xFFF59E0B)
+                          : const Color(0xFF94A3B8),
+                    ),
+                  ),
+                if (c.activePages.isNotEmpty && maxWidth >= 720) ...<Widget>[
+                  Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 2),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF8FAFC),
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(color: const Color(0xFFE2E8F0)),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        InkWell(
+                          borderRadius: BorderRadius.circular(99),
+                          onTap: c.hasPrevPage ? c.goToPrevPage : null,
+                          child: Padding(
+                            padding: const EdgeInsets.all(2),
+                            child: Icon(
+                              Icons.chevron_left_rounded,
+                              size: 17,
+                              color: c.hasPrevPage
+                                  ? const Color(0xFF334155)
+                                  : const Color(0xFFCBD5E1),
+                            ),
+                          ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
+                          child: Text(
+                            '${c.activePageIndex + 1}/${c.activePages.length}',
+                            style: const TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFF475569),
+                            ),
+                          ),
+                        ),
+                        InkWell(
+                          borderRadius: BorderRadius.circular(99),
+                          onTap: c.hasNextPage ? c.goToNextPage : null,
+                          child: Padding(
+                            padding: const EdgeInsets.all(2),
+                            child: Icon(
+                              Icons.chevron_right_rounded,
+                              size: 17,
+                              color: c.hasNextPage
+                                  ? const Color(0xFF334155)
+                                  : const Color(0xFFCBD5E1),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
                 IconButton(
                   tooltip: '快速新建画板页',
+                  visualDensity: VisualDensity.compact,
                   onPressed: () => c.createPage(),
                   icon: const Icon(Icons.note_add_outlined, size: 19),
                 ),
@@ -581,7 +728,17 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
           PopupMenuButton<String>(
             tooltip: '画板页选项',
             onSelected: (value) {
-              if (value == 'clear') {
+              if (value == 'import_pdf') {
+                showImportPdfDialog(context, c);
+              } else if (value == 'export_png') {
+                _exportCurrentPagePng();
+              } else if (value == 'export_md') {
+                _exportNotebookMarkdown();
+              } else if (value == 'duplicate_page') {
+                c.duplicatePage(c.activePageId);
+              } else if (value == 'page_guide') {
+                c.togglePageGuide();
+              } else if (value == 'clear') {
                 _confirmClearPage();
               } else if (value == 'reset_view') {
                 c.resetViewport();
@@ -590,6 +747,67 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
               }
             },
             itemBuilder: (_) => <PopupMenuEntry<String>>[
+              if (c.platform.canImportPdf)
+                const PopupMenuItem<String>(
+                  value: 'import_pdf',
+                  child: Row(
+                    children: <Widget>[
+                      Icon(
+                        Icons.picture_as_pdf_outlined,
+                        size: 18,
+                        color: Color(0xFFDC2626),
+                      ),
+                      SizedBox(width: 8),
+                      Text('导入 PDF 讲义 / 文档'),
+                    ],
+                  ),
+                ),
+              const PopupMenuItem<String>(
+                value: 'export_png',
+                child: Row(
+                  children: <Widget>[
+                    Icon(Icons.image_outlined, size: 18),
+                    SizedBox(width: 8),
+                    Text('导出当前页高清图片 (.png)'),
+                  ],
+                ),
+              ),
+              const PopupMenuItem<String>(
+                value: 'export_md',
+                child: Row(
+                  children: <Widget>[
+                    Icon(Icons.description_outlined, size: 18),
+                    SizedBox(width: 8),
+                    Text('导出整本笔记摘要 (.md)'),
+                  ],
+                ),
+              ),
+              const PopupMenuDivider(),
+              const PopupMenuItem<String>(
+                value: 'duplicate_page',
+                child: Row(
+                  children: <Widget>[
+                    Icon(Icons.copy_all_outlined, size: 18),
+                    SizedBox(width: 8),
+                    Text('复制当前画板页'),
+                  ],
+                ),
+              ),
+              PopupMenuItem<String>(
+                value: 'page_guide',
+                child: Row(
+                  children: <Widget>[
+                    Icon(
+                      c.showPageGuide
+                          ? Icons.check_box
+                          : Icons.check_box_outline_blank,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 8),
+                    const Text('显示 A4 分页参考线'),
+                  ],
+                ),
+              ),
               PopupMenuItem<String>(
                 value: 'stylus',
                 child: Row(

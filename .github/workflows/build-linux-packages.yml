@@ -45,6 +45,7 @@ jobs:
             file \
             curl \
             desktop-file-utils \
+            poppler-utils \
             xz-utils
 
       - name: Install Flutter SDK (stable)

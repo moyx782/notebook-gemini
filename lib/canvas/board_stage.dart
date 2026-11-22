@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
@@ -16,6 +17,8 @@ enum _GestureMode {
   pinchZoom,
   drawStroke,
   drawShape,
+  lasso,
+  dragLassoGroup,
   erase,
   laser,
   dragElement,
@@ -81,6 +84,45 @@ class _BoardStageState extends State<BoardStage> {
   double _dragOrigW = 0;
   double _dragOrigH = 0;
 
+  // Lasso group drag state
+  Map<String, Offset> _lassoDragOrigins = const <String, Offset>{};
+  Offset _lassoDragStartScene = Offset.zero;
+
+  // Hold-to-Snap straight line timer (380ms pause at end of freehand stroke)
+  Timer? _holdSnapTimer;
+  Offset? _holdAnchorLocalPos;
+
+  @override
+  void dispose() {
+    _cancelHoldSnapTimer();
+    super.dispose();
+  }
+
+  void _cancelHoldSnapTimer() {
+    _holdSnapTimer?.cancel();
+    _holdSnapTimer = null;
+    _holdAnchorLocalPos = null;
+  }
+
+  void _updateHoldSnapCheck(Offset localPos) {
+    final c = widget.controller;
+    if (c.isActiveStrokeSnappedLine) {
+      _cancelHoldSnapTimer();
+      return;
+    }
+    final anchor = _holdAnchorLocalPos;
+    if (anchor != null && (localPos - anchor).distance <= 3.5) {
+      return;
+    }
+    _holdAnchorLocalPos = localPos;
+    _holdSnapTimer?.cancel();
+    _holdSnapTimer = Timer(const Duration(milliseconds: 380), () {
+      _holdSnapTimer = null;
+      if (!mounted || _mode != _GestureMode.drawStroke) return;
+      widget.controller.snapActiveStrokeToStraightLine();
+    });
+  }
+
   Offset _toScene(Offset local) {
     final c = widget.controller;
     return (local - c.panOffset) / c.zoom;
@@ -114,6 +156,7 @@ class _BoardStageState extends State<BoardStage> {
       _touchPointers[event.pointer] = event.localPosition;
       _touchLastSeenMs[event.pointer] = nowMs;
       if (_touchPointers.length >= 2) {
+        _cancelHoldSnapTimer();
         if (_mode == _GestureMode.drawStroke &&
             widget.controller.hasSubstantialActiveStroke) {
           widget.controller.finishLocalStroke();
@@ -121,6 +164,7 @@ class _BoardStageState extends State<BoardStage> {
           widget.controller.cancelLocalStroke();
         }
         widget.controller.cancelLocalShape();
+        widget.controller.cancelLasso();
         _mode = _GestureMode.pinchZoom;
         _activePointerId = null;
         _activePointerKind = null;
@@ -139,6 +183,7 @@ class _BoardStageState extends State<BoardStage> {
       }
       if (_touchPointers.length >= 2) {
         if (_mode != _GestureMode.pinchZoom) {
+          _cancelHoldSnapTimer();
           if (_mode == _GestureMode.drawStroke &&
               widget.controller.hasSubstantialActiveStroke) {
             widget.controller.finishLocalStroke();
@@ -146,6 +191,7 @@ class _BoardStageState extends State<BoardStage> {
             widget.controller.cancelLocalStroke();
           }
           widget.controller.cancelLocalShape();
+          widget.controller.cancelLasso();
           _mode = _GestureMode.pinchZoom;
           _activePointerId = null;
           _activePointerKind = null;
@@ -237,6 +283,7 @@ class _BoardStageState extends State<BoardStage> {
         return;
       }
       if (_mode == _GestureMode.drawStroke) {
+        _cancelHoldSnapTimer();
         if (c.hasSubstantialActiveStroke) {
           c.finishLocalStroke();
         } else {
@@ -244,6 +291,8 @@ class _BoardStageState extends State<BoardStage> {
         }
       } else if (_mode == _GestureMode.drawShape) {
         c.cancelLocalShape();
+      } else if (_mode == _GestureMode.lasso) {
+        c.cancelLasso();
       }
       _draggingElementId = null;
     }
@@ -280,8 +329,23 @@ class _BoardStageState extends State<BoardStage> {
 
     if (c.tool == CanvasTool.pen || c.tool == CanvasTool.highlighter) {
       _mode = _GestureMode.drawStroke;
+      _cancelHoldSnapTimer();
+      _holdAnchorLocalPos = event.localPosition;
       final pressure = computeEffectivePressure(event, null, 0);
       c.startLocalStroke(scenePos, pressure: pressure);
+      return;
+    }
+
+    if (c.tool == CanvasTool.lasso) {
+      final groupRect = c.selectionBounds;
+      if (groupRect != null && groupRect.inflate(12.0).contains(scenePos)) {
+        _lassoDragOrigins = c.captureSelectedOrigins();
+        _lassoDragStartScene = scenePos;
+        _mode = _GestureMode.dragLassoGroup;
+      } else {
+        _mode = _GestureMode.lasso;
+        c.startLasso(scenePos);
+      }
       return;
     }
 
@@ -316,6 +380,15 @@ class _BoardStageState extends State<BoardStage> {
     }
 
     if (c.tool == CanvasTool.select) {
+      final groupRect = c.selectionBounds;
+      if (c.selectedElementIds.length > 1 &&
+          groupRect != null &&
+          groupRect.inflate(10.0).contains(scenePos)) {
+        _lassoDragOrigins = c.captureSelectedOrigins();
+        _lassoDragStartScene = scenePos;
+        _mode = _GestureMode.dragLassoGroup;
+        return;
+      }
       final hit = c.hitTestElement(scenePos);
       if (hit != null) {
         c.selectElement(hit.id);
@@ -326,8 +399,7 @@ class _BoardStageState extends State<BoardStage> {
         _dragOrigH = hit.height;
         _mode = _GestureMode.dragElement;
       } else {
-        c.selectElement(null);
-        c.setEditingCard(null);
+        c.clearSelection();
         _mode = _GestureMode.pan;
       }
     }
@@ -359,10 +431,22 @@ class _BoardStageState extends State<BoardStage> {
         final pressure =
             computeEffectivePressure(event, _prevLocalPos, dtMs);
         c.appendLocalStrokePoint(scenePos, pressure: pressure, dtMs: dtMs);
+        _updateHoldSnapCheck(event.localPosition);
         break;
 
       case _GestureMode.drawShape:
         c.updateLocalShape(scenePos);
+        break;
+
+      case _GestureMode.lasso:
+        c.appendLassoPoint(scenePos);
+        break;
+
+      case _GestureMode.dragLassoGroup:
+        c.previewMoveSelectedElements(
+          _lassoDragOrigins,
+          scenePos - _lassoDragStartScene,
+        );
         break;
 
       case _GestureMode.erase:
@@ -402,6 +486,7 @@ class _BoardStageState extends State<BoardStage> {
       return;
     }
 
+    _cancelHoldSnapTimer();
     final c = widget.controller;
     switch (_mode) {
       case _GestureMode.drawStroke:
@@ -434,6 +519,17 @@ class _BoardStageState extends State<BoardStage> {
         } else {
           c.cancelLocalShape();
         }
+        break;
+      case _GestureMode.lasso:
+        if (event is PointerUpEvent) {
+          c.finishLasso();
+        } else {
+          c.cancelLasso();
+        }
+        break;
+      case _GestureMode.dragLassoGroup:
+        c.commitGroupMoveUndo(_lassoDragOrigins);
+        _lassoDragOrigins = const <String, Offset>{};
         break;
       case _GestureMode.dragElement:
         final elId = _draggingElementId;
@@ -530,6 +626,7 @@ class _BoardStageState extends State<BoardStage> {
                             panOffset: c.panOffset,
                             zoom: c.zoom,
                             selectedElementId: null,
+                            showPageGuide: c.showPageGuide,
                             paintPaper: true,
                             paintInk: false,
                           ),

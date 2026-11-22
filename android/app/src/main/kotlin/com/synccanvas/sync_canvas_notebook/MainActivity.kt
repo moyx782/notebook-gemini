@@ -4,30 +4,45 @@ import android.app.Activity
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.pdf.PdfRenderer
 import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
+import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.util.Base64
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.Executors
 import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 class MainActivity : FlutterActivity() {
     companion object {
         private const val CHANNEL = "com.synccanvas/native_bridge"
         private const val REQ_PICK_IMAGE = 9101
         private const val REQ_SCAN_QR = 9102
+        private const val REQ_PICK_PDF = 9103
         private const val MAX_IMAGE_DIM = 1600
+        private const val MAX_PDF_DIM = 1440
     }
 
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private var pendingImageResult: MethodChannel.Result? = null
     private var pendingQrResult: MethodChannel.Result? = null
+    private var pendingPdfResult: MethodChannel.Result? = null
+    private var pendingPdfMaxPages: Int = 30
     private var nearbyManager: NearbyBootstrapManager? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -45,6 +60,12 @@ class MainActivity : FlutterActivity() {
                     pendingImageResult?.success(null)
                     pendingImageResult = result
                     launchImagePicker()
+                }
+                "pickPdf" -> {
+                    pendingPdfResult?.success(null)
+                    pendingPdfResult = result
+                    pendingPdfMaxPages = (call.argument<Int>("maxPages") ?: 30).coerceIn(1, 120)
+                    launchPdfPicker()
                 }
                 "scanQrCode" -> {
                     pendingQrResult?.success(null)
@@ -131,6 +152,24 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun launchPdfPicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            type = "application/pdf"
+            addCategory(Intent.CATEGORY_OPENABLE)
+        }
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(intent, REQ_PICK_PDF)
+        } catch (_: Exception) {
+            val fallback = Intent(Intent.ACTION_GET_CONTENT).apply {
+                type = "application/pdf"
+                addCategory(Intent.CATEGORY_OPENABLE)
+            }
+            @Suppress("DEPRECATION")
+            startActivityForResult(fallback, REQ_PICK_PDF)
+        }
+    }
+
     @Deprecated("Required for FlutterActivity compatibility across API 24+")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         @Suppress("DEPRECATION")
@@ -150,6 +189,22 @@ class MainActivity : FlutterActivity() {
                 ioExecutor.execute {
                     val dataUrl = encodePickedImageToDataUrl(uri)
                     runOnUiThread { callback.success(dataUrl) }
+                }
+            }
+            REQ_PICK_PDF -> {
+                val callback = pendingPdfResult
+                pendingPdfResult = null
+                val maxPages = pendingPdfMaxPages
+                if (callback == null) return
+
+                val uri = if (resultCode == Activity.RESULT_OK) data?.data else null
+                if (uri == null) {
+                    callback.success(null)
+                    return
+                }
+                ioExecutor.execute {
+                    val pdfJson = renderPickedPdfToJson(uri, maxPages)
+                    runOnUiThread { callback.success(pdfJson) }
                 }
             }
             REQ_SCAN_QR -> {
@@ -261,6 +316,117 @@ class MainActivity : FlutterActivity() {
         } catch (_: Exception) {
         }
         return matrix
+    }
+
+    private fun resolveDisplayName(uri: Uri): String {
+        try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor ->
+                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0 && cursor.moveToFirst()) {
+                        val name = cursor.getString(idx)?.trim()
+                        if (!name.isNullOrEmpty()) return name
+                    }
+                }
+        } catch (_: Exception) {
+        }
+        return uri.lastPathSegment?.substringAfterLast('/')?.ifEmpty { "document.pdf" }
+            ?: "document.pdf"
+    }
+
+    private fun renderPickedPdfToJson(uri: Uri, maxPages: Int): String {
+        val fileName = resolveDisplayName(uri)
+        var tempCopy: File? = null
+        var pfd: ParcelFileDescriptor? = null
+        var renderer: PdfRenderer? = null
+        return try {
+            try {
+                pfd = contentResolver.openFileDescriptor(uri, "r")
+                if (pfd != null) {
+                    renderer = PdfRenderer(pfd!!)
+                }
+            } catch (_: Exception) {
+                try {
+                    pfd?.close()
+                } catch (_: Exception) {
+                }
+                pfd = null
+                renderer = null
+            }
+
+            if (renderer == null) {
+                val copied = File(cacheDir, "synccanvas_import_${System.currentTimeMillis()}.pdf")
+                tempCopy = copied
+                contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(copied).use { output ->
+                        input.copyTo(output)
+                    }
+                } ?: return JSONObject()
+                    .put("fileName", fileName)
+                    .put("error", "无法读取所选 PDF 文件")
+                    .toString()
+                pfd = ParcelFileDescriptor.open(copied, ParcelFileDescriptor.MODE_READ_ONLY)
+                renderer = PdfRenderer(pfd!!)
+            }
+
+            val activeRenderer = renderer!!
+            val totalPages = activeRenderer.pageCount
+            val limit = min(totalPages, maxPages)
+            val pagesArray = JSONArray()
+
+            for (i in 0 until limit) {
+                activeRenderer.openPage(i).use { page ->
+                    val rawW = max(1, page.width)
+                    val rawH = max(1, page.height)
+                    val maxSide = max(rawW, rawH)
+                    val scale = (MAX_PDF_DIM.toFloat() / maxSide.toFloat()).coerceIn(0.25f, 2.4f)
+                    val bmpW = max(1, (rawW * scale).roundToInt())
+                    val bmpH = max(1, (rawH * scale).roundToInt())
+
+                    val bitmap = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
+                    val canvas = Canvas(bitmap)
+                    canvas.drawColor(Color.WHITE)
+                    page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                    val out = ByteArrayOutputStream()
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                    bitmap.recycle()
+
+                    val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+                    pagesArray.put(
+                        JSONObject()
+                            .put("pageNumber", i + 1)
+                            .put("width", bmpW)
+                            .put("height", bmpH)
+                            .put("dataUrl", "data:image/jpeg;base64,$b64")
+                    )
+                }
+            }
+
+            JSONObject()
+                .put("fileName", fileName)
+                .put("totalPages", totalPages)
+                .put("pages", pagesArray)
+                .toString()
+        } catch (e: Exception) {
+            JSONObject()
+                .put("fileName", fileName)
+                .put("error", e.message ?: "PDF 渲染失败")
+                .toString()
+        } finally {
+            try {
+                renderer?.close()
+            } catch (_: Exception) {
+            }
+            try {
+                pfd?.close()
+            } catch (_: Exception) {
+            }
+            try {
+                tempCopy?.delete()
+            } catch (_: Exception) {
+            }
+        }
     }
 
     override fun onDestroy() {

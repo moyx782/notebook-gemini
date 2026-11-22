@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:notebook_core/notebook_core.dart';
 
 import '../state/notebook_controller.dart';
+import 'canvas_toolbar.dart';
 
 class NotebookSidebar extends StatefulWidget {
   const NotebookSidebar({
@@ -148,6 +149,8 @@ class _NotebookSidebarState extends State<NotebookSidebar> {
     final query = c.searchQuery.trim().toLowerCase();
     final notebooks = c.notebooks;
     final activePage = c.activePage;
+    final contentHits =
+        query.isEmpty ? const <SearchHit>[] : c.searchWorkspaceContent(query);
 
     return Container(
       color: const Color(0xFFF8FAFC),
@@ -213,7 +216,7 @@ class _NotebookSidebarState extends State<NotebookSidebar> {
               onChanged: c.setSearchQuery,
               style: const TextStyle(fontSize: 13),
               decoration: InputDecoration(
-                hintText: '搜索笔记本或画板页...',
+                hintText: '搜索笔记本、页名或卡片全文...',
                 prefixIcon: const Icon(Icons.search, size: 18),
                 suffixIcon: query.isEmpty
                     ? null
@@ -240,7 +243,105 @@ class _NotebookSidebarState extends State<NotebookSidebar> {
               ),
             ),
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 8),
+
+          // Quick note actions & star filter
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: <Widget>[
+                  FilterChip(
+                    avatar: Icon(
+                      c.bookmarkFilterOnly
+                          ? Icons.star_rounded
+                          : Icons.star_border_rounded,
+                      size: 15,
+                      color: c.bookmarkFilterOnly
+                          ? const Color(0xFFF59E0B)
+                          : const Color(0xFF64748B),
+                    ),
+                    label: const Text('仅看星标', style: TextStyle(fontSize: 11.5)),
+                    visualDensity: VisualDensity.compact,
+                    selected: c.bookmarkFilterOnly,
+                    onSelected: c.setBookmarkFilterOnly,
+                  ),
+                  if (c.platform.canImportPdf) ...<Widget>[
+                    const SizedBox(width: 6),
+                    ActionChip(
+                      avatar: const Icon(
+                        Icons.picture_as_pdf_outlined,
+                        size: 15,
+                        color: Color(0xFFDC2626),
+                      ),
+                      label:
+                          const Text('导入 PDF', style: TextStyle(fontSize: 11.5)),
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => showImportPdfDialog(context, c),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 6),
+
+          // Full-text card/sticky search hits
+          if (contentHits.isNotEmpty)
+            Container(
+              constraints: const BoxConstraints(maxHeight: 150),
+              margin: const EdgeInsets.fromLTRB(10, 0, 10, 6),
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFFEEF2FF),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0xFFC7D2FE)),
+              ),
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: contentHits.length,
+                itemBuilder: (ctx, idx) {
+                  final hit = contentHits[idx];
+                  return InkWell(
+                    onTap: () {
+                      c.focusOnElement(hit.pageId, hit.elementId);
+                      widget.onCloseDrawer?.call();
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 5,
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Text(
+                            '${hit.notebookTitle} · ${hit.pageTitle}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 10.5,
+                              fontWeight: FontWeight.w700,
+                              color: Color(0xFF4F46E5),
+                            ),
+                          ),
+                          Text(
+                            hit.snippet,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 11.5,
+                              color: Color(0xFF1E293B),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
 
           // Notebook + Pages tree
           Expanded(
@@ -252,18 +353,24 @@ class _NotebookSidebarState extends State<NotebookSidebar> {
                 final pages = c.doc.pagesForNotebook(nb.id);
                 final nbMatches =
                     query.isEmpty || nb.title.toLowerCase().contains(query);
-                final filteredPages = nbMatches
+                var filteredPages = nbMatches
                     ? pages
                     : pages
                         .where((p) => p.title.toLowerCase().contains(query))
                         .toList();
+                if (c.bookmarkFilterOnly) {
+                  filteredPages =
+                      filteredPages.where((p) => p.bookmarked).toList();
+                }
 
-                if (query.isNotEmpty && !nbMatches && filteredPages.isEmpty) {
+                if ((query.isNotEmpty && !nbMatches && filteredPages.isEmpty) ||
+                    (c.bookmarkFilterOnly && filteredPages.isEmpty)) {
                   return const SizedBox.shrink();
                 }
 
-                final isExpanded =
-                    nb.id == c.activeNotebookId || query.isNotEmpty;
+                final isExpanded = nb.id == c.activeNotebookId ||
+                    query.isNotEmpty ||
+                    c.bookmarkFilterOnly;
 
                 return Container(
                   margin: const EdgeInsets.only(bottom: 8),
@@ -331,25 +438,53 @@ class _NotebookSidebarState extends State<NotebookSidebar> {
                           padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
                           child: Column(
                             children: <Widget>[
-                              for (final page in filteredPages)
+                              for (var pIdx = 0;
+                                  pIdx < filteredPages.length;
+                                  pIdx++)
                                 _PageRowTile(
-                                  page: page,
-                                  isActive: page.id == c.activePageId,
+                                  page: filteredPages[pIdx],
+                                  isActive:
+                                      filteredPages[pIdx].id == c.activePageId,
                                   canDelete: pages.length > 1,
+                                  canMoveUp:
+                                      pages.indexOf(filteredPages[pIdx]) > 0,
+                                  canMoveDown:
+                                      pages.indexOf(filteredPages[pIdx]) <
+                                          pages.length - 1,
                                   peersOnPage: c.remotePeers
-                                      .where((p) => p.activePageId == page.id)
+                                      .where(
+                                        (p) =>
+                                            p.activePageId ==
+                                            filteredPages[pIdx].id,
+                                      )
                                       .toList(),
                                   onSelect: () {
-                                    c.selectPage(page.id);
+                                    c.selectPage(filteredPages[pIdx].id);
                                     widget.onCloseDrawer?.call();
                                   },
+                                  onToggleBookmark: () => c.togglePageBookmark(
+                                    filteredPages[pIdx].id,
+                                  ),
+                                  onDuplicate: () =>
+                                      c.duplicatePage(filteredPages[pIdx].id),
+                                  onMoveUp: () => c.movePageOrder(
+                                    filteredPages[pIdx].id,
+                                    -1,
+                                  ),
+                                  onMoveDown: () => c.movePageOrder(
+                                    filteredPages[pIdx].id,
+                                    1,
+                                  ),
                                   onRename: () => _showRenameDialog(
                                     title: '重命名画板页',
-                                    initialValue: page.title,
-                                    onConfirm: (val) =>
-                                        c.renamePage(page.id, val),
+                                    initialValue: filteredPages[pIdx].title,
+                                    onConfirm: (val) => c.renamePage(
+                                      filteredPages[pIdx].id,
+                                      val,
+                                    ),
                                   ),
-                                  onDelete: () => c.deletePage(page.id),
+                                  onDelete: () =>
+                                      c.deletePage(filteredPages[pIdx].id),
                                 ),
                             ],
                           ),
@@ -447,8 +582,14 @@ class _PageRowTile extends StatelessWidget {
     required this.page,
     required this.isActive,
     required this.canDelete,
+    required this.canMoveUp,
+    required this.canMoveDown,
     required this.peersOnPage,
     required this.onSelect,
+    required this.onToggleBookmark,
+    required this.onDuplicate,
+    required this.onMoveUp,
+    required this.onMoveDown,
     required this.onRename,
     required this.onDelete,
   });
@@ -456,8 +597,14 @@ class _PageRowTile extends StatelessWidget {
   final NotebookPageModel page;
   final bool isActive;
   final bool canDelete;
+  final bool canMoveUp;
+  final bool canMoveDown;
   final List<PeerPresence> peersOnPage;
   final VoidCallback onSelect;
+  final VoidCallback onToggleBookmark;
+  final VoidCallback onDuplicate;
+  final VoidCallback onMoveUp;
+  final VoidCallback onMoveDown;
   final VoidCallback onRename;
   final VoidCallback onDelete;
 
@@ -473,6 +620,10 @@ class _PageRowTile extends StatelessWidget {
         return Icons.view_headline_rounded;
       case PageBackground.cornell:
         return Icons.dashboard_customize_outlined;
+      case PageBackground.mistakeBook:
+        return Icons.rule_folder_outlined;
+      case PageBackground.weeklyPlan:
+        return Icons.calendar_view_week_rounded;
     }
   }
 
@@ -486,7 +637,7 @@ class _PageRowTile extends StatelessWidget {
         onTap: onSelect,
         onLongPress: onRename,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           child: Row(
             children: <Widget>[
               Icon(
@@ -511,7 +662,7 @@ class _PageRowTile extends StatelessWidget {
                   ),
                 ),
               ),
-              for (final peer in peersOnPage.take(3))
+              for (final peer in peersOnPage.take(2))
                 Tooltip(
                   message: '${peer.displayName} (${peer.formFactor.label}) 正在此页',
                   child: Container(
@@ -524,27 +675,94 @@ class _PageRowTile extends StatelessWidget {
                     ),
                   ),
                 ),
-              if (isActive) ...<Widget>[
+              if (page.bookmarked || isActive)
                 InkWell(
-                  onTap: onRename,
+                  onTap: onToggleBookmark,
                   borderRadius: BorderRadius.circular(6),
-                  child: const Padding(
-                    padding: EdgeInsets.all(2),
-                    child: Icon(Icons.edit_outlined,
-                        size: 14, color: Color(0xFF4F46E5)),
-                  ),
-                ),
-                if (canDelete)
-                  InkWell(
-                    onTap: onDelete,
-                    borderRadius: BorderRadius.circular(6),
-                    child: const Padding(
-                      padding: EdgeInsets.all(2),
-                      child: Icon(Icons.close,
-                          size: 14, color: Color(0xFF94A3B8)),
+                  child: Padding(
+                    padding: const EdgeInsets.all(2),
+                    child: Icon(
+                      page.bookmarked
+                          ? Icons.star_rounded
+                          : Icons.star_border_rounded,
+                      size: 15,
+                      color: page.bookmarked
+                          ? const Color(0xFFF59E0B)
+                          : const Color(0xFF94A3B8),
                     ),
                   ),
-              ],
+                ),
+              if (isActive)
+                PopupMenuButton<String>(
+                  tooltip: '页面管理',
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 136),
+                  onSelected: (action) {
+                    switch (action) {
+                      case 'rename':
+                        onRename();
+                        break;
+                      case 'duplicate':
+                        onDuplicate();
+                        break;
+                      case 'up':
+                        onMoveUp();
+                        break;
+                      case 'down':
+                        onMoveDown();
+                        break;
+                      case 'delete':
+                        onDelete();
+                        break;
+                    }
+                  },
+                  itemBuilder: (_) => <PopupMenuEntry<String>>[
+                    const PopupMenuItem<String>(
+                      value: 'rename',
+                      height: 36,
+                      child: Text('重命名本页', style: TextStyle(fontSize: 13)),
+                    ),
+                    const PopupMenuItem<String>(
+                      value: 'duplicate',
+                      height: 36,
+                      child: Text('复制本页', style: TextStyle(fontSize: 13)),
+                    ),
+                    if (canMoveUp)
+                      const PopupMenuItem<String>(
+                        value: 'up',
+                        height: 36,
+                        child: Text('上移一页', style: TextStyle(fontSize: 13)),
+                      ),
+                    if (canMoveDown)
+                      const PopupMenuItem<String>(
+                        value: 'down',
+                        height: 36,
+                        child: Text('下移一页', style: TextStyle(fontSize: 13)),
+                      ),
+                    if (canDelete) ...<PopupMenuEntry<String>>[
+                      const PopupMenuDivider(),
+                      const PopupMenuItem<String>(
+                        value: 'delete',
+                        height: 36,
+                        child: Text(
+                          '删除本页',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: Color(0xFFDC2626),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                  child: const Padding(
+                    padding: EdgeInsets.all(2),
+                    child: Icon(
+                      Icons.more_horiz_rounded,
+                      size: 16,
+                      color: Color(0xFF4F46E5),
+                    ),
+                  ),
+                ),
             ],
           ),
         ),

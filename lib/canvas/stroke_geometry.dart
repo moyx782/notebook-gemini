@@ -140,3 +140,73 @@ Path buildSmoothCenterlinePath(
   path.lineTo(points.last.dx, points.last.dy);
   return path;
 }
+
+/// Ray-casting point-in-polygon check in scene coordinates.
+bool isPointInPolygon(Offset pt, List<Offset> polygon) {
+  if (polygon.length < 3) return false;
+  var inside = false;
+  for (var i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    final xi = polygon[i].dx;
+    final yi = polygon[i].dy;
+    final xj = polygon[j].dx;
+    final yj = polygon[j].dy;
+
+    final intersects = ((yi > pt.dy) != (yj > pt.dy)) &&
+        (pt.dx < (xj - xi) * (pt.dy - yi) / ((yj - yi) == 0 ? 1e-9 : (yj - yi)) + xi);
+    if (intersects) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/// Returns true when [el] should be captured by a freehand lasso [polygon].
+/// Locked elements (such as PDF background sheets) are never captured.
+bool elementMatchesLasso(CanvasElementModel el, List<Offset> polygon) {
+  if (el.deleted || el.locked || polygon.length < 3) return false;
+
+  var minX = polygon.first.dx;
+  var maxX = polygon.first.dx;
+  var minY = polygon.first.dy;
+  var maxY = polygon.first.dy;
+  for (final p in polygon) {
+    if (p.dx < minX) minX = p.dx;
+    if (p.dx > maxX) maxX = p.dx;
+    if (p.dy < minY) minY = p.dy;
+    if (p.dy > maxY) maxY = p.dy;
+  }
+  final polyBounds = Rect.fromLTRB(minX, minY, maxX, maxY);
+  final rawB = el.bounds;
+  final eb = Rect.fromLTRB(rawB.left, rawB.top, rawB.right, rawB.bottom);
+  if (!polyBounds.overlaps(eb.inflate(6.0))) return false;
+
+  if (el.kind == ElementKind.stroke || el.kind == ElementKind.highlighter) {
+    if (el.points.isEmpty) {
+      return isPointInPolygon(eb.center, polygon);
+    }
+    final step = math.max(1, el.points.length ~/ 20);
+    for (var i = 0; i < el.points.length; i += step) {
+      final p = el.points[i];
+      if (isPointInPolygon(Offset(el.x + p.dx, el.y + p.dy), polygon)) {
+        return true;
+      }
+    }
+    final last = el.points.last;
+    return isPointInPolygon(Offset(el.x + last.dx, el.y + last.dy), polygon);
+  }
+
+  if (isPointInPolygon(eb.center, polygon)) return true;
+  var cornersInside = 0;
+  for (final corner in <Offset>[
+    eb.topLeft,
+    eb.topRight,
+    eb.bottomLeft,
+    eb.bottomRight,
+  ]) {
+    if (isPointInPolygon(corner, polygon)) {
+      cornersInside += 1;
+      if (cornersInside >= 2) return true;
+    }
+  }
+  return false;
+}
