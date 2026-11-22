@@ -16,7 +16,77 @@ export 'platform_adapter_stub.dart'
         OperationOutcome,
         PlatformAdapter;
 
+/// Resolves the offline Flutter Web bundle directory for the embedded host
+/// server by checking explicit overrides, bundled app paths, and repository
+/// `build/web` ancestors.
+Future<String?> resolveEmbeddedWebDir({
+  String? executablePath,
+  String? currentDirPath,
+  String? envOverride,
+}) async {
+  final sep = Platform.pathSeparator;
+  final candidates = <String>[];
+
+  final explicit = envOverride?.trim();
+  final fromEnv = Platform.environment['SYNCCANVAS_WEB_DIR']?.trim();
+  final overridePath =
+      (explicit != null && explicit.isNotEmpty) ? explicit : fromEnv;
+  if (overridePath != null && overridePath.isNotEmpty) {
+    candidates.add(overridePath);
+  }
+
+  var resolvedExe = executablePath?.trim() ?? '';
+  if (resolvedExe.isEmpty) {
+    try {
+      resolvedExe = Platform.resolvedExecutable;
+    } catch (_) {
+      resolvedExe = '';
+    }
+  }
+
+  Directory? exeDir;
+  if (resolvedExe.isNotEmpty) {
+    exeDir = File(resolvedExe).parent;
+    candidates.add('${exeDir.path}${sep}web');
+    candidates.add('${exeDir.path}${sep}data${sep}web');
+    candidates.add('${exeDir.parent.path}${sep}Resources${sep}web');
+  }
+
+  final cwd = (currentDirPath != null && currentDirPath.trim().isNotEmpty)
+      ? currentDirPath.trim()
+      : Directory.current.path;
+  if (cwd.isNotEmpty) {
+    candidates.add('$cwd${sep}build${sep}web');
+  }
+
+  if (exeDir != null) {
+    var probe = exeDir.parent;
+    for (var depth = 0; depth < 6; depth++) {
+      candidates.add('${probe.path}${sep}web');
+      candidates.add('${probe.path}${sep}build${sep}web');
+      final parent = probe.parent;
+      if (parent.path == probe.path) break;
+      probe = parent;
+    }
+  }
+
+  final seen = <String>{};
+  for (final dirPath in candidates) {
+    final normalized = Directory(dirPath).absolute.path;
+    if (!seen.add(normalized)) continue;
+    final indexFile = File('$normalized${sep}index.html');
+    if (await indexFile.exists()) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
 class IoPlatformAdapter implements PlatformAdapter {
+  IoPlatformAdapter({this.webDirOverride});
+
+  final String? webDirOverride;
+
   static const MethodChannel _channel =
       MethodChannel('com.synccanvas/native_bridge');
 
@@ -400,6 +470,7 @@ try {
     final cacheDir = await _ensureCacheDir();
     final hostedDir = Directory('${cacheDir.path}/hosted_rooms');
     await hostedDir.create(recursive: true);
+    final webDir = await resolveEmbeddedWebDir(envOverride: webDirOverride);
 
     final server = SyncServer();
     try {
@@ -407,7 +478,7 @@ try {
         host: '0.0.0.0',
         port: preferredPort,
         dataDir: hostedDir.path,
-        webDir: null,
+        webDir: webDir,
         apkPath: null,
       );
     } on SocketException {
@@ -415,7 +486,7 @@ try {
         host: '0.0.0.0',
         port: 0,
         dataDir: hostedDir.path,
-        webDir: null,
+        webDir: webDir,
         apkPath: null,
       );
     }

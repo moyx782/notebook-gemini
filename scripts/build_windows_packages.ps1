@@ -46,10 +46,13 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 Write-Host "==> Target Windows architecture: $Arch (version $Version)"
 
 Invoke-Checked 'flutter' @('--suppress-analytics', 'config', '--enable-windows-desktop')
+Invoke-Checked 'flutter' @('--suppress-analytics', 'config', '--enable-web')
 Invoke-Checked 'flutter' @('--suppress-analytics', 'pub', 'get')
 Invoke-Checked 'flutter' @('--suppress-analytics', 'build', 'windows', '--release')
+Invoke-Checked 'flutter' @('--suppress-analytics', 'build', 'web', '--release', '--no-web-resources-cdn', '--no-wasm-dry-run')
 
 $ReleaseDir = Join-Path $RootDir "build\windows\$Arch\runner\Release"
+$WebBuildDir = Join-Path $RootDir 'build\web'
 $ExePath = Join-Path $ReleaseDir 'sync_canvas_notebook.exe'
 if (-not (Test-Path $ExePath)) {
   throw "Expected Flutter Windows release binary not found at: $ExePath"
@@ -88,6 +91,35 @@ New-Item -ItemType Directory -Force -Path $DistDir, $StageAppDir | Out-Null
 
 Write-Host "==> Staging release payload into $StageAppDir"
 Copy-Item -Path (Join-Path $ReleaseDir '*') -Destination $StageAppDir -Recurse -Force
+
+# Embed offline Flutter Web static assets next to the executable so Host Mode
+# serves the shared Web whiteboard directly over LAN/Hotspot without Internet/CDN.
+$StageWebDir = Join-Path $StageAppDir 'web'
+New-Item -ItemType Directory -Force -Path $StageWebDir | Out-Null
+Copy-Item -Path (Join-Path $WebBuildDir '*') -Destination $StageWebDir -Recurse -Force
+Get-ChildItem -Path $StageWebDir -Recurse -File | Where-Object {
+  $_.Name -eq '.last_build_id' -or
+  $_.Name -like '*.symbols' -or
+  $_.Name -like 'skwasm*' -or
+  $_.Name -like 'wimp*'
+} | Remove-Item -Force
+
+$webRequired = @(
+  (Join-Path $StageWebDir 'index.html'),
+  (Join-Path $StageWebDir 'main.dart.js'),
+  (Join-Path $StageWebDir 'flutter_bootstrap.js'),
+  (Join-Path $StageWebDir 'canvaskit\canvaskit.wasm')
+)
+foreach ($req in $webRequired) {
+  if (-not (Test-Path $req)) {
+    throw "Required offline Web bundle file missing: $req"
+  }
+}
+$bootstrapContent = Get-Content -Raw (Join-Path $StageWebDir 'flutter_bootstrap.js')
+if ($bootstrapContent -notmatch '"useLocalCanvasKit"\s*:\s*true') {
+  throw "flutter_bootstrap.js does not enable useLocalCanvasKit:true (CDN fallback risk)"
+}
+Write-Host "==> Verified offline Web bundle inside $StageWebDir (useLocalCanvasKit=true)"
 
 # Bundle MSVC C++ Runtime DLLs if available from Visual Studio Redist
 $vswhereCandidates = @(

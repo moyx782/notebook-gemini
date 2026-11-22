@@ -40,12 +40,41 @@ mkdir -p "$DIST_DIR" "$STAGE_DIR"
 
 echo "==> Building Flutter Linux release bundle ($FLUTTER_ARCH, version $VERSION)..."
 flutter --suppress-analytics config --enable-linux-desktop
+flutter --suppress-analytics config --enable-web
 flutter --suppress-analytics pub get
 flutter --suppress-analytics build linux --release
+flutter --suppress-analytics build web --release --no-web-resources-cdn --no-wasm-dry-run
 
 BUNDLE_DIR="$ROOT_DIR/build/linux/$FLUTTER_ARCH/release/bundle"
 if [ ! -x "$BUNDLE_DIR/sync_canvas_notebook" ]; then
   echo "Expected Flutter bundle binary not found at: $BUNDLE_DIR/sync_canvas_notebook" >&2
+  exit 1
+fi
+
+echo "==> Embedding offline Web bundle into $BUNDLE_DIR/web..."
+rm -rf "$BUNDLE_DIR/web"
+mkdir -p "$BUNDLE_DIR/web"
+cp -a "$ROOT_DIR/build/web/." "$BUNDLE_DIR/web/"
+find "$BUNDLE_DIR/web" -type f \( \
+  -name '.last_build_id' -o \
+  -name '*.symbols' -o \
+  -name 'skwasm*' -o \
+  -name 'wimp*' \
+\) -delete
+
+for required_file in \
+  "$BUNDLE_DIR/web/index.html" \
+  "$BUNDLE_DIR/web/main.dart.js" \
+  "$BUNDLE_DIR/web/flutter_bootstrap.js" \
+  "$BUNDLE_DIR/web/canvaskit/canvaskit.wasm"
+do
+  if [ ! -f "$required_file" ]; then
+    echo "Required offline Web bundle file missing: $required_file" >&2
+    exit 1
+  fi
+done
+if ! grep -Eq '"useLocalCanvasKit"[[:space:]]*:[[:space:]]*true' "$BUNDLE_DIR/web/flutter_bootstrap.js"; then
+  echo "flutter_bootstrap.js does not enable useLocalCanvasKit:true" >&2
   exit 1
 fi
 

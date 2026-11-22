@@ -497,4 +497,105 @@ void main() {
       await listener.stop();
     }
   });
+
+  test('SyncServer serves offline Web bundle (WASM MIME) and blocks traversal',
+      () async {
+    final tempRoot =
+        await Directory.systemTemp.createTemp('sync_canvas_web_static_');
+    final dataDir = Directory('${tempRoot.path}/data');
+    final webDir = Directory('${tempRoot.path}/web');
+    final canvasKitDir = Directory('${webDir.path}/canvaskit');
+    await canvasKitDir.create(recursive: true);
+
+    await File('${webDir.path}/index.html')
+        .writeAsString('<html><head></head><body>Offline Canvas</body></html>');
+    await File('${webDir.path}/main.dart.js').writeAsString('console.log(1);');
+    await File('${canvasKitDir.path}/canvaskit.wasm')
+        .writeAsBytes(<int>[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+
+    // Sibling directory sharing the "web" prefix ("web_secret") must never be readable
+    final siblingDir = Directory('${tempRoot.path}/web_secret');
+    await siblingDir.create(recursive: true);
+    final secretFile = File('${siblingDir.path}/secret.txt');
+    await secretFile.writeAsString('TOP_SECRET_VALUE');
+
+    final escapeLink = Link('${webDir.path}/escape.txt');
+    var symlinkCreated = false;
+    try {
+      await escapeLink.create(secretFile.path);
+      symlinkCreated = true;
+    } catch (_) {
+      // Unprivileged Windows environments may disallow symlink creation.
+    }
+
+    final server = SyncServer();
+    await server.start(
+      host: '127.0.0.1',
+      port: 0,
+      dataDir: dataDir.path,
+      webDir: webDir.path,
+      apkPath: null,
+    );
+
+    final client = HttpClient();
+    try {
+      final infoReq = await client.get(
+        '127.0.0.1',
+        server.boundPort,
+        '/api/info?room=default',
+      );
+      final infoResp = await infoReq.close();
+      expect(infoResp.statusCode, HttpStatus.ok);
+      final infoJson =
+          jsonDecode(await utf8.decoder.bind(infoResp).join())
+              as Map<String, dynamic>;
+      expect(infoJson['webReady'], isTrue);
+
+      final rootReq = await client.get(
+        '127.0.0.1',
+        server.boundPort,
+        '/?room=default',
+      );
+      final rootResp = await rootReq.close();
+      expect(rootResp.statusCode, HttpStatus.ok);
+      final html = await utf8.decoder.bind(rootResp).join();
+      expect(html, contains('Offline Canvas'));
+      expect(html, isNot(contains('flutter build web')));
+
+      final wasmReq = await client.get(
+        '127.0.0.1',
+        server.boundPort,
+        '/canvaskit/canvaskit.wasm',
+      );
+      final wasmResp = await wasmReq.close();
+      expect(wasmResp.statusCode, HttpStatus.ok);
+      expect(wasmResp.headers.contentType?.mimeType, 'application/wasm');
+
+      final travReq = await client.get(
+        '127.0.0.1',
+        server.boundPort,
+        '/%2e%2e/web_secret/secret.txt',
+      );
+      final travResp = await travReq.close();
+      final travBody = await utf8.decoder.bind(travResp).join();
+      expect(travBody, isNot(contains('TOP_SECRET_VALUE')));
+
+      if (symlinkCreated) {
+        final symReq = await client.get(
+          '127.0.0.1',
+          server.boundPort,
+          '/escape.txt',
+        );
+        final symResp = await symReq.close();
+        expect(symResp.statusCode, HttpStatus.forbidden);
+        await symResp.drain<void>();
+      }
+    } finally {
+      client.close(force: true);
+      await server.close();
+      try {
+        await tempRoot.delete(recursive: true);
+      } catch (_) {}
+    }
+  });
 }

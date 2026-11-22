@@ -510,6 +510,10 @@ class SyncServer {
   Future<void> _handleStaticWeb(HttpRequest request) async {
     final webDir = _webDir;
     if (webDir == null) {
+      final rawHost = request.headers.value(HttpHeaders.hostHeader)?.trim();
+      final displayHost =
+          (rawHost != null && rawHost.isNotEmpty) ? rawHost : '<LAN-IP>:$boundPort';
+      final escapedHost = const HtmlEscape().convert(displayHost);
       _applyCors(request.response);
       request.response.statusCode = HttpStatus.ok;
       request.response.headers.contentType = ContentType.html;
@@ -517,11 +521,12 @@ class SyncServer {
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>SyncCanvas Sync Server</title></head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 32px; max-width: 680px; margin: auto;">
+<body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 32px; max-width: 680px; margin: auto; line-height: 1.6;">
   <h2>SyncCanvas 同步服务正在运行</h2>
-  <p>当前未检测到 <code>build/web</code> 静态构建产物。请在项目根目录执行：</p>
-  <pre style="background: #f3f4f6; padding: 12px; border-radius: 8px;">flutter build web</pre>
-  <p>WebSocket 地址：<code>ws://&lt;LAN-IP&gt;:$boundPort/ws</code></p>
+  <p>WebSocket 服务已就绪，桌面端 / 平板 / 手机原生客户端可直接使用下方地址接入协同：</p>
+  <pre style="background: #f3f4f6; padding: 12px; border-radius: 8px;">ws://$escapedHost/ws</pre>
+  <p>当前未检测到内置 Web 静态资源目录。若从源码目录运行，请执行：</p>
+  <pre style="background: #f3f4f6; padding: 12px; border-radius: 8px;">flutter build web --no-web-resources-cdn</pre>
   <p>房间状态 API：<a href="/api/info">/api/info</a></p>
 </body>
 </html>
@@ -555,7 +560,16 @@ class SyncServer {
       return;
     }
     final resolvedTarget = target.resolveSymbolicLinksSync();
-    if (!resolvedTarget.startsWith(resolvedRoot)) {
+    final sep = Platform.pathSeparator;
+    final normalizedRoot = resolvedRoot.endsWith(sep)
+        ? resolvedRoot
+        : '$resolvedRoot$sep';
+    final withinRoot = Platform.isWindows
+        ? (resolvedTarget.toLowerCase() == resolvedRoot.toLowerCase() ||
+            resolvedTarget.toLowerCase().startsWith(normalizedRoot.toLowerCase()))
+        : (resolvedTarget == resolvedRoot ||
+            resolvedTarget.startsWith(normalizedRoot));
+    if (!withinRoot) {
       request.response.statusCode = HttpStatus.forbidden;
       await request.response.close();
       return;
@@ -597,10 +611,15 @@ class SyncServer {
       return 'application/javascript; charset=utf-8';
     }
     if (lower.endsWith('.wasm')) return 'application/wasm';
-    if (lower.endsWith('.json')) return 'application/json; charset=utf-8';
+    if (lower.endsWith('.json') || lower.endsWith('.map')) {
+      return 'application/json; charset=utf-8';
+    }
+    if (lower.endsWith('.txt')) return 'text/plain; charset=utf-8';
     if (lower.endsWith('.css')) return 'text/css; charset=utf-8';
     if (lower.endsWith('.png')) return 'image/png';
     if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+    if (lower.endsWith('.webp')) return 'image/webp';
+    if (lower.endsWith('.gif')) return 'image/gif';
     if (lower.endsWith('.svg')) return 'image/svg+xml';
     if (lower.endsWith('.otf')) return 'font/otf';
     if (lower.endsWith('.ttf')) return 'font/ttf';

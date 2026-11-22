@@ -25,7 +25,7 @@ fi
 
 if [ "$REBUILD_WEB" = true ] || [ ! -f "$SCRIPT_DIR/build/web/index.html" ]; then
   echo "正在构建 Flutter Web 端静态资源 (build/web)..."
-  flutter build web
+  flutter build web --release --no-web-resources-cdn --no-wasm-dry-run
 fi
 
 if [ ! -f "$SCRIPT_DIR/packages/notebook_core/.dart_tool/package_config.json" ]; then
