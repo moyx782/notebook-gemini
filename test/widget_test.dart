@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:io';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:notebook_core/notebook_core.dart';
@@ -401,4 +403,198 @@ void main() {
       await clientCtrl.stopDiscovery();
     },
   );
+
+  testWidgets(
+    'Tablet stylus writing ignores multi-touch palm contacts and preserves ink on pointercancel',
+    (WidgetTester tester) async {
+      final tabletCtrl = NotebookController(
+        initialPeerId: 'tablet-stylus-peer',
+        initialDisplayName: 'iPad Pro',
+        initialFormFactor: DeviceFormFactor.tablet,
+        autoConnect: false,
+      );
+      addTearDown(tabletCtrl.dispose);
+
+      await tester.binding.setSurfaceSize(const Size(834, 1194));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      await tester.pumpWidget(SyncCanvasApp(controller: tabletCtrl));
+      await tester.pumpAndSettle();
+
+      tabletCtrl.setTool(CanvasTool.pen);
+      await tester.pump();
+
+      var rootRebuildsDuringStroke = 0;
+      void countRootRebuild() => rootRebuildsDuringStroke++;
+      tabletCtrl.addListener(countRootRebuild);
+
+      var livePaintTicks = 0;
+      void countLivePaint() => livePaintTicks++;
+      tabletCtrl.livePaintListenable.addListener(countLivePaint);
+
+      final beforeCount = tabletCtrl.activeElements.length;
+      final boardCenter = tester.getCenter(find.byType(BoardStage));
+
+      // 1. Start writing with a hardware stylus
+      final stylus = await tester.startGesture(
+        boardCenter + const Offset(-80, -30),
+        kind: PointerDeviceKind.stylus,
+        pointer: 11,
+      );
+      await stylus.moveBy(const Offset(24, 10));
+      await stylus.moveBy(const Offset(24, 12));
+
+      // 2. Two resting-palm touch contacts land mid-stroke — must NOT cancel or
+      // hijack the active stylus stroke!
+      final palm1 = await tester.startGesture(
+        boardCenter + const Offset(90, 120),
+        kind: PointerDeviceKind.touch,
+        pointer: 21,
+      );
+      final palm2 = await tester.startGesture(
+        boardCenter + const Offset(130, 145),
+        kind: PointerDeviceKind.touch,
+        pointer: 22,
+      );
+      await palm1.moveBy(const Offset(8, 6));
+      await palm2.moveBy(const Offset(-6, 8));
+
+      // Stylus keeps writing smoothly with zero root widget rebuilds
+      await stylus.moveBy(const Offset(30, 15));
+      await stylus.moveBy(const Offset(28, 8));
+      expect(tabletCtrl.activeStroke, isNotNull);
+      expect(rootRebuildsDuringStroke, 0);
+      expect(livePaintTicks, greaterThanOrEqualTo(5));
+
+      await palm1.up();
+      await palm2.up();
+      await stylus.up();
+      await tester.pumpAndSettle();
+
+      tabletCtrl.removeListener(countRootRebuild);
+      tabletCtrl.livePaintListenable.removeListener(countLivePaint);
+
+      expect(tabletCtrl.activeElements.length, beforeCount + 1);
+      final stylusStroke = tabletCtrl.activeElements.last;
+      expect(stylusStroke.kind, ElementKind.stroke);
+      expect(stylusStroke.points.length, greaterThanOrEqualTo(5));
+      expect(stylusStroke.width, greaterThan(90));
+
+      // 3. Intentional touch stroke interrupted by OS/browser PointerCancelEvent
+      // must still commit locally instead of flashing and disappearing!
+      final countAfterStylus = tabletCtrl.activeElements.length;
+      final finger = await tester.startGesture(
+        boardCenter + const Offset(-60, 80),
+        kind: PointerDeviceKind.touch,
+        pointer: 31,
+      );
+      for (var i = 0; i < 6; i++) {
+        await finger.moveBy(const Offset(14, 6));
+      }
+      expect(tabletCtrl.hasSubstantialActiveStroke, isTrue);
+      await finger.cancel();
+      await tester.pumpAndSettle();
+
+      expect(tabletCtrl.activeElements.length, countAfterStylus + 1);
+    },
+  );
+
+  test(
+    'Collaborative end-to-end: local tablet renders stroke before async upload and buffers mid-stroke remote ops without dropping ink',
+    () async {
+      final hostAdapter = createPlatformAdapter();
+      addTearDown(hostAdapter.dispose);
+      final port = await hostAdapter.startEmbeddedServer(preferredPort: 0);
+      expect(port, isNotNull);
+
+      await HttpOverrides.runWithHttpOverrides(() async {
+        final tabletCtrl = NotebookController(
+          initialPeerId: 'collab-tablet',
+          initialDisplayName: 'Tablet Writer',
+          initialFormFactor: DeviceFormFactor.tablet,
+          autoConnect: false,
+        );
+        final desktopCtrl = NotebookController(
+          initialPeerId: 'collab-desktop',
+          initialDisplayName: 'Desktop Collaborator',
+          initialFormFactor: DeviceFormFactor.desktop,
+          autoConnect: false,
+        );
+        addTearDown(tabletCtrl.dispose);
+        addTearDown(desktopCtrl.dispose);
+
+        await tabletCtrl.configureConnection(
+          wsUrl: 'ws://127.0.0.1:$port/ws',
+          roomId: 'smooth-ink-room',
+        );
+        await desktopCtrl.configureConnection(
+          wsUrl: 'ws://127.0.0.1:$port/ws',
+          roomId: 'smooth-ink-room',
+        );
+        await tabletCtrl.connect();
+        await desktopCtrl.connect();
+
+        // Wait for both clients to finish initial welcome handshake
+        final deadline = DateTime.now().add(const Duration(seconds: 4));
+        while (DateTime.now().isBefore(deadline) &&
+            (tabletCtrl.connectionState != SyncConnectionState.connected ||
+                desktopCtrl.connectionState != SyncConnectionState.connected)) {
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+        }
+        expect(tabletCtrl.connectionState, SyncConnectionState.connected);
+        expect(desktopCtrl.connectionState, SyncConnectionState.connected);
+
+        var tabletRootNotifiesMidStroke = 0;
+        void onTabletRootNotify() => tabletRootNotifiesMidStroke++;
+
+        // Tablet starts drawing locally
+        tabletCtrl.startLocalStroke(const Offset(100, 100), pressure: 0.7);
+        tabletCtrl.addListener(onTabletRootNotify);
+
+        for (var i = 1; i <= 12; i++) {
+          tabletCtrl.appendLocalStrokePoint(
+            Offset(100 + i * 8.0, 100 + i * 4.0),
+            pressure: 0.75,
+          );
+          // Meanwhile Desktop blasts cursor presence + commits a sticky note mid-stroke!
+          desktopCtrl.updateCursorPresence(
+            Offset(300 + i * 5.0, 220),
+            visible: true,
+          );
+          if (i == 6) {
+            desktopCtrl.createStickyNote(initialText: '桌面端并发便签');
+            desktopCtrl.flushPendingUploadsNow();
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 12));
+        }
+
+        // Mid-stroke: zero root widget rebuilds occurred on the tablet even while
+        // receiving remote cursor presence & remote opBatch!
+        expect(tabletCtrl.activeStroke, isNotNull);
+        expect(tabletRootNotifiesMidStroke, 0);
+        tabletCtrl.removeListener(onTabletRootNotify);
+
+        final beforeFinishCount = tabletCtrl.activeElements.length;
+        tabletCtrl.finishLocalStroke();
+
+        // Immediately on pen-up (BEFORE async network upload timer even fires),
+        // the tablet's local committed elements ALREADY include the new stroke!
+        expect(tabletCtrl.activeStroke, isNull);
+        expect(
+          tabletCtrl.activeElements.length,
+          greaterThanOrEqualTo(beforeFinishCount + 1),
+        );
+
+        // Wait briefly for the 36ms background upload batch to reach Desktop
+        final syncDeadline = DateTime.now().add(const Duration(seconds: 4));
+        while (DateTime.now().isBefore(syncDeadline) &&
+            tabletCtrl.doc.deepDigest() != desktopCtrl.doc.deepDigest()) {
+          await Future<void>.delayed(const Duration(milliseconds: 25));
+        }
+        expect(tabletCtrl.doc.deepDigest(), desktopCtrl.doc.deepDigest());
+      }, _RealSocketHttpOverrides());
+    },
+  );
 }
+
+class _RealSocketHttpOverrides extends HttpOverrides {}

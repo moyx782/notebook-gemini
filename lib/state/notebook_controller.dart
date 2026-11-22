@@ -196,12 +196,31 @@ class NotebookController extends ChangeNotifier {
   Timer? _reconnectTimer;
   Timer? _saveTimer;
   Timer? _laserDecayTimer;
+  Timer? _uploadFlushTimer;
+  Timer? _liveStrokeStreamTimer;
+  Timer? _deferredInboundFlushTimer;
   int _reconnectAttempts = 0;
   bool _triedWebPortFallback = false;
   bool _disposed = false;
   bool _initialized = false;
 
+  // Fine-grained paint revision notifiers so high-frequency stylus strokes &
+  // remote cursors never force full-tree Widget rebuilds or static ink repaints.
+  final ValueNotifier<int> _livePaintNotifier = ValueNotifier<int>(0);
+  int _committedInkRevision = 0;
+  String? _cachedElementsPageId;
+  int _cachedElementsRevision = -1;
+  List<CanvasElementModel> _cachedActiveElements = const <CanvasElementModel>[];
+
+  // Local-first rendering -> asynchronous background upload queues
   final List<CrdtOp> _pendingOps = <CrdtOp>[];
+  final List<CrdtOp> _outboundOpQueue = <CrdtOp>[];
+  final List<CrdtOp> _deferredInboundOps = <CrdtOp>[];
+  String? _pendingStrokeEndId;
+  ElementKind _pendingStrokeEndKind = ElementKind.stroke;
+  int _pendingStrokeEndColor = 0;
+  double _pendingStrokeEndWidth = 3.5;
+  double _activeStrokePathLength = 0.0;
   final List<UndoPatch> _undoStack = <UndoPatch>[];
   final List<UndoPatch> _redoStack = <UndoPatch>[];
 
@@ -233,7 +252,6 @@ class NotebookController extends ChangeNotifier {
   final Map<String, LaserTrailState> _laserTrails = <String, LaserTrailState>{};
   final List<LaserPoint> _pendingLocalLaserPoints = <LaserPoint>[];
   int _lastPresenceSentMs = 0;
-  int _lastStrokeStreamSentMs = 0;
   int _strokeStreamSeq = 0;
   int _lastLaserStreamSentMs = 0;
 
@@ -291,6 +309,27 @@ class NotebookController extends ChangeNotifier {
 
   ActiveStrokePreview? get activeStroke => _activeStroke;
   ActiveShapePreview? get activeShape => _activeShape;
+  Listenable get livePaintListenable => _livePaintNotifier;
+  int get committedInkRevision => _committedInkRevision;
+  Map<String, PeerPresence> get remotePeersMap => _remotePeers;
+
+  /// True when the local in-progress stroke has enough points or travel to be
+  /// considered intentional handwriting rather than an accidental palm/pinch tap.
+  bool get hasSubstantialActiveStroke {
+    final s = _activeStroke;
+    if (s == null) return false;
+    return s.points.length >= 5 || _activeStrokePathLength >= 14.0;
+  }
+
+  void _bumpLivePaint() {
+    if (!_disposed) {
+      _livePaintNotifier.value = (_livePaintNotifier.value + 1) & 0x3fffffff;
+    }
+  }
+
+  void _bumpCommittedInk() {
+    _committedInkRevision = (_committedInkRevision + 1) & 0x3fffffff;
+  }
 
   List<PeerPresence> get remotePeers =>
       _remotePeers.values.toList()
@@ -322,8 +361,16 @@ class NotebookController extends ChangeNotifier {
   List<NotebookPageModel> get activePages =>
       _doc.pagesForNotebook(_activeNotebookId);
   NotebookPageModel? get activePage => _doc.getPage(_activePageId);
-  List<CanvasElementModel> get activeElements =>
-      _doc.elementsForPage(_activePageId);
+  List<CanvasElementModel> get activeElements {
+    if (_cachedElementsPageId == _activePageId &&
+        _cachedElementsRevision == _committedInkRevision) {
+      return _cachedActiveElements;
+    }
+    _cachedElementsPageId = _activePageId;
+    _cachedElementsRevision = _committedInkRevision;
+    _cachedActiveElements = _doc.elementsForPage(_activePageId);
+    return _cachedActiveElements;
+  }
 
   Future<void> initialize({double shortestSideLogicalPixels = 1024}) async {
     if (_initialized) return;
@@ -432,12 +479,14 @@ class NotebookController extends ChangeNotifier {
     if (nextZoom == _zoom && nextPan == _panOffset) return;
     _zoom = nextZoom;
     _panOffset = nextPan;
+    _bumpLivePaint();
     notifyListeners();
   }
 
   void resetViewport() {
     _zoom = 1.0;
     _panOffset = const Offset(24, 24);
+    _bumpLivePaint();
     notifyListeners();
   }
 
@@ -450,11 +499,15 @@ class NotebookController extends ChangeNotifier {
     final nextPan = focal - scenePoint * nextZoom;
     _zoom = nextZoom;
     _panOffset = nextPan;
+    _bumpLivePaint();
     notifyListeners();
   }
 
   void selectNotebook(String notebookId) {
     if (_activeNotebookId == notebookId) return;
+    if (_activeStroke != null) {
+      finishLocalStroke();
+    }
     _activeNotebookId = notebookId;
     final pages = _doc.pagesForNotebook(notebookId);
     if (pages.isNotEmpty) {
@@ -463,6 +516,7 @@ class NotebookController extends ChangeNotifier {
     _selectedElementId = null;
     _editingCardId = null;
     _followingPeerId = null;
+    _bumpLivePaint();
     notifyListeners();
     sendPresence(force: true);
   }
@@ -470,10 +524,14 @@ class NotebookController extends ChangeNotifier {
   void selectPage(String pageId) {
     final page = _doc.getPage(pageId);
     if (page == null || page.deleted) return;
+    if (_activeStroke != null && _activePageId != page.id) {
+      finishLocalStroke();
+    }
     _activeNotebookId = page.notebookId;
     _activePageId = page.id;
     _selectedElementId = null;
     _editingCardId = null;
+    _bumpLivePaint();
     notifyListeners();
     sendPresence(force: true);
   }
@@ -638,11 +696,15 @@ class NotebookController extends ChangeNotifier {
     double pressure = 0.5,
     bool forceHighlighter = false,
   }) {
+    if (_activeStroke != null) {
+      finishLocalStroke();
+    }
     final isHighlighter = forceHighlighter || _tool == CanvasTool.highlighter;
     final kind = isHighlighter ? ElementKind.highlighter : ElementKind.stroke;
     final width = isHighlighter ? _highlighterWidth : _strokeWidth;
     final strokeId = _newEntityId('el');
     _strokeStreamSeq = 0;
+    _activeStrokePathLength = 0.0;
 
     _activeStroke = ActiveStrokePreview(
       strokeId: strokeId,
@@ -658,8 +720,10 @@ class NotebookController extends ChangeNotifier {
         ),
       ],
     );
-    notifyListeners();
-    _emitStrokeStream(isEnd: false);
+    // Render locally on LiveOverlayPainter immediately with ZERO widget rebuild
+    // and ZERO synchronous network encoding on the touch event thread.
+    _bumpLivePaint();
+    _scheduleLiveStrokeStream();
   }
 
   void appendLocalStrokePoint(
@@ -670,10 +734,13 @@ class NotebookController extends ChangeNotifier {
     final stroke = _activeStroke;
     if (stroke == null) return;
     final last = stroke.points.last;
-    final distSq = (scenePos.dx - last.dx) * (scenePos.dx - last.dx) +
-        (scenePos.dy - last.dy) * (scenePos.dy - last.dy);
-    if (distSq < 1.5) return;
+    final dx = scenePos.dx - last.dx;
+    final dy = scenePos.dy - last.dy;
+    final distSq = dx * dx + dy * dy;
+    final minDistSq = (0.35 / (_zoom * _zoom)).clamp(0.04, 1.0);
+    if (distSq < minDistSq) return;
 
+    _activeStrokePathLength += math.sqrt(distSq);
     stroke.points.add(
       StrokePoint(
         dx: scenePos.dx,
@@ -682,26 +749,28 @@ class NotebookController extends ChangeNotifier {
         dtMs: dtMs,
       ),
     );
-    notifyListeners();
-
-    final now = DateTime.now().millisecondsSinceEpoch;
-    if (now - _lastStrokeStreamSentMs >= 28) {
-      _lastStrokeStreamSentMs = now;
-      _emitStrokeStream(isEnd: false);
-    }
+    _bumpLivePaint();
+    _scheduleLiveStrokeStream();
   }
 
   void finishLocalStroke() {
+    _liveStrokeStreamTimer?.cancel();
+    _liveStrokeStreamTimer = null;
+
     final stroke = _activeStroke;
     if (stroke == null) return;
     _activeStroke = null;
-    _emitStrokeStream(isEnd: true);
+    _activeStrokePathLength = 0.0;
 
     if (stroke.points.isEmpty) {
+      _flushDeferredInboundOps(notify: false);
+      _bumpLivePaint();
       notifyListeners();
       return;
     }
 
+    // Step 1: Render locally FIRST. Commit into local CRDT document in the exact
+    // same frame _activeStroke is cleared so there is zero 1-frame flicker/gap.
     var minX = stroke.points.first.dx;
     var maxX = stroke.points.first.dx;
     var minY = stroke.points.first.dy;
@@ -721,10 +790,10 @@ class NotebookController extends ChangeNotifier {
         )
         .toList();
 
-    _commitPatch(
-      EntityType.element,
-      stroke.strokeId,
-      <String, Object?>{
+    final pair = _doc.mutateEntity(
+      entityType: EntityType.element,
+      entityId: stroke.strokeId,
+      fields: <String, Object?>{
         'pageId': _activePageId,
         'kind': stroke.kind.name,
         'x': minX,
@@ -740,13 +809,41 @@ class NotebookController extends ChangeNotifier {
         'deleted': false,
       },
     );
+    _undoStack.add(pair.undoPatch);
+    _redoStack.clear();
+
+    _flushDeferredInboundOps(notify: false);
+    _bumpCommittedInk();
+    _bumpLivePaint();
+    notifyListeners();
+
+    // Step 2: Upload asynchronously in background batch AFTER local render.
+    _enqueueStrokeUpload(
+      pair.forward,
+      endedStrokeId: stroke.strokeId,
+      kind: stroke.kind,
+      colorValue: stroke.colorValue,
+      strokeWidth: stroke.strokeWidth,
+    );
   }
 
   void cancelLocalStroke() {
-    if (_activeStroke == null) return;
-    _emitStrokeStream(isEnd: true);
+    _liveStrokeStreamTimer?.cancel();
+    _liveStrokeStreamTimer = null;
+    final prev = _activeStroke;
+    if (prev == null) return;
     _activeStroke = null;
-    notifyListeners();
+    _activeStrokePathLength = 0.0;
+    _pendingStrokeEndId = prev.strokeId;
+    _pendingStrokeEndKind = prev.kind;
+    _pendingStrokeEndColor = prev.colorValue;
+    _pendingStrokeEndWidth = prev.strokeWidth;
+    _scheduleOutboundUploadFlush();
+    final hadDeferred = _flushDeferredInboundOps(notify: false);
+    _bumpLivePaint();
+    if (hadDeferred) {
+      notifyListeners();
+    }
   }
 
   void startLocalShape(Offset scenePos, ShapeKind shapeKind) {
@@ -759,7 +856,7 @@ class NotebookController extends ChangeNotifier {
       colorValue: _activeColor.toARGB32(),
       strokeWidth: math.max(2.5, _strokeWidth),
     );
-    notifyListeners();
+    _bumpLivePaint();
   }
 
   void updateLocalShape(Offset scenePos) {
@@ -767,7 +864,7 @@ class NotebookController extends ChangeNotifier {
     if (shape == null) return;
     shape.currentX = scenePos.dx;
     shape.currentY = scenePos.dy;
-    notifyListeners();
+    _bumpLivePaint();
   }
 
   void finishLocalShape() {
@@ -826,13 +923,14 @@ class NotebookController extends ChangeNotifier {
       },
     );
     _selectedElementId = id;
+    _bumpLivePaint();
     notifyListeners();
   }
 
   void cancelLocalShape() {
     if (_activeShape == null) return;
     _activeShape = null;
-    notifyListeners();
+    _bumpLivePaint();
   }
 
   String createTextCard({
@@ -1082,6 +1180,7 @@ class NotebookController extends ChangeNotifier {
     _redoStack.clear();
     _selectedElementId = null;
     _editingCardId = null;
+    _bumpCommittedInk();
     _dispatchOps(ops);
     notifyListeners();
   }
@@ -1111,9 +1210,9 @@ class NotebookController extends ChangeNotifier {
     );
     _pendingLocalLaserPoints.add(pt);
     _ensureLaserDecayTimer();
-    notifyListeners();
+    _bumpLivePaint();
 
-    if (now - _lastLaserStreamSentMs >= 30 && _channel != null) {
+    if (now - _lastLaserStreamSentMs >= 45 && _channel != null) {
       _lastLaserStreamSentMs = now;
       final batch = List<LaserPoint>.from(_pendingLocalLaserPoints);
       _pendingLocalLaserPoints.clear();
@@ -1136,6 +1235,7 @@ class NotebookController extends ChangeNotifier {
     final pair = _doc.applyUndoPatch(patch);
     _redoStack.add(pair.undoPatch);
     _ensureValidSelection();
+    _bumpCommittedInk();
     _dispatchOps(<CrdtOp>[pair.forward]);
     notifyListeners();
   }
@@ -1146,6 +1246,7 @@ class NotebookController extends ChangeNotifier {
     final pair = _doc.applyUndoPatch(patch);
     _undoStack.add(pair.undoPatch);
     _ensureValidSelection();
+    _bumpCommittedInk();
     _dispatchOps(<CrdtOp>[pair.forward]);
     notifyListeners();
   }
@@ -1155,8 +1256,11 @@ class NotebookController extends ChangeNotifier {
   // ---------------------------------------------------------------------------
 
   void updateCursorPresence(Offset scenePos, {bool visible = true}) {
+    // Skip redundant cursor presence packets while actively writing a stroke so
+    // the input event loop stays 100% focused on local 120Hz/240Hz ink rendering.
+    if (_activeStroke != null && visible) return;
     final now = DateTime.now().millisecondsSinceEpoch;
-    if (visible && now - _lastPresenceSentMs < 55) return;
+    if (visible && now - _lastPresenceSentMs < 75) return;
     _lastPresenceSentMs = now;
     _safeSendMessage(
       SyncMessage.presence(
@@ -1615,6 +1719,7 @@ class NotebookController extends ChangeNotifier {
     final applied = _doc.applyOps(ops);
     if (applied.isEmpty) return;
     _ensureValidSelection();
+    _bumpCommittedInk();
     _scheduleSave();
     notifyListeners();
   }
@@ -1640,6 +1745,7 @@ class NotebookController extends ChangeNotifier {
           : decoded;
       final changed = _doc.mergeSnapshotJson(snapshot);
       _ensureValidSelection();
+      _bumpCommittedInk();
       _scheduleSave();
       notifyListeners();
 
@@ -1705,9 +1811,10 @@ class NotebookController extends ChangeNotifier {
           _lanApkUrls = lanApk.map((e) => e.toString()).toList();
         }
 
-        if (_pendingOps.isNotEmpty) {
-          final toFlush = List<CrdtOp>.from(_pendingOps);
+        if (_pendingOps.isNotEmpty || _outboundOpQueue.isNotEmpty) {
+          final toFlush = <CrdtOp>[..._pendingOps, ..._outboundOpQueue];
           _pendingOps.clear();
+          _outboundOpQueue.clear();
           _safeSendMessage(
             SyncMessage.opBatch(
               roomId: _roomId,
@@ -1718,6 +1825,8 @@ class NotebookController extends ChangeNotifier {
         }
 
         _ensureValidSelection();
+        _bumpCommittedInk();
+        _bumpLivePaint();
         _scheduleSave();
         notifyListeners();
         break;
@@ -1725,9 +1834,24 @@ class NotebookController extends ChangeNotifier {
       case SyncMessageType.opBatch:
         final ops = msg.readOps();
         if (ops.isEmpty) break;
+        // Defer applying remote CRDT ops while the local stylus/finger is in
+        // mid-stroke so incoming collaborative edits never stall or flash the
+        // active stroke; flush automatically on pen-up (or within 1.2s max).
+        if (_activeStroke != null) {
+          _deferredInboundOps.addAll(ops);
+          _deferredInboundFlushTimer ??= Timer(
+            const Duration(milliseconds: 1200),
+            () {
+              _deferredInboundFlushTimer = null;
+              _flushDeferredInboundOps(notify: true);
+            },
+          );
+          break;
+        }
         final applied = _doc.applyOps(ops);
         if (applied.isNotEmpty) {
           _ensureValidSelection();
+          _bumpCommittedInk();
           _scheduleSave();
           notifyListeners();
         }
@@ -1736,8 +1860,17 @@ class NotebookController extends ChangeNotifier {
       case SyncMessageType.presence:
         final peer = msg.readPeer();
         if (peer == null || peer.peerId == _peerId) break;
+        final prev = _remotePeers[peer.peerId];
         _remotePeers[peer.peerId] = peer;
-        if (_followingPeerId == peer.peerId) {
+
+        var needsWidgetRebuild = prev == null ||
+            prev.displayName != peer.displayName ||
+            prev.formFactor != peer.formFactor ||
+            prev.colorValue != peer.colorValue ||
+            prev.activePageId != peer.activePageId ||
+            prev.activeNotebookId != peer.activeNotebookId;
+
+        if (_followingPeerId == peer.peerId && _activeStroke == null) {
           if (peer.activePageId.isNotEmpty) {
             final page = _doc.getPage(peer.activePageId);
             if (page != null && !page.deleted) {
@@ -1751,8 +1884,13 @@ class NotebookController extends ChangeNotifier {
               _viewportSize.height * 0.5 - peer.cursorY * _zoom,
             );
           }
+          needsWidgetRebuild = true;
         }
-        notifyListeners();
+
+        _bumpLivePaint();
+        if (needsWidgetRebuild) {
+          notifyListeners();
+        }
         break;
 
       case SyncMessageType.strokeStream:
@@ -1763,7 +1901,7 @@ class NotebookController extends ChangeNotifier {
         } else {
           _remoteLiveStrokes[frame.peerId] = frame;
         }
-        notifyListeners();
+        _bumpLivePaint();
         break;
 
       case SyncMessageType.laserStream:
@@ -1794,7 +1932,7 @@ class NotebookController extends ChangeNotifier {
           points: <LaserPoint>[...baseList, ...incoming],
         );
         _ensureLaserDecayTimer();
-        notifyListeners();
+        _bumpLivePaint();
         break;
 
       case SyncMessageType.peerLeft:
@@ -1805,6 +1943,7 @@ class NotebookController extends ChangeNotifier {
           if (_followingPeerId == leftId) {
             _followingPeerId = null;
           }
+          _bumpLivePaint();
           notifyListeners();
         }
         break;
@@ -1822,6 +1961,10 @@ class NotebookController extends ChangeNotifier {
     _wsSub?.cancel();
     _wsSub = null;
     _channel = null;
+    if (_outboundOpQueue.isNotEmpty) {
+      _pendingOps.addAll(_outboundOpQueue);
+      _outboundOpQueue.clear();
+    }
 
     if (_platform.isWeb && !_triedWebPortFallback) {
       final parsed = Uri.tryParse(_wsUrl);
@@ -1880,6 +2023,7 @@ class NotebookController extends ChangeNotifier {
       _undoStack.add(pair.undoPatch);
       _redoStack.clear();
     }
+    _bumpCommittedInk();
     _dispatchOps(<CrdtOp>[pair.forward]);
     notifyListeners();
   }
@@ -1887,17 +2031,120 @@ class NotebookController extends ChangeNotifier {
   void _dispatchOps(List<CrdtOp> ops) {
     if (ops.isEmpty) return;
     if (_connectionState == SyncConnectionState.connected && _channel != null) {
-      _safeSendMessage(
-        SyncMessage.opBatch(
-          roomId: _roomId,
-          senderId: _peerId,
-          ops: ops,
-        ),
-      );
+      _outboundOpQueue.addAll(ops);
+      _scheduleOutboundUploadFlush();
     } else {
       _pendingOps.addAll(ops);
     }
     _scheduleSave();
+  }
+
+  void _enqueueStrokeUpload(
+    CrdtOp strokeOp, {
+    required String endedStrokeId,
+    required ElementKind kind,
+    required int colorValue,
+    required double strokeWidth,
+  }) {
+    if (_connectionState == SyncConnectionState.connected && _channel != null) {
+      _pendingStrokeEndId = endedStrokeId;
+      _pendingStrokeEndKind = kind;
+      _pendingStrokeEndColor = colorValue;
+      _pendingStrokeEndWidth = strokeWidth;
+      _outboundOpQueue.add(strokeOp);
+      _scheduleOutboundUploadFlush();
+    } else {
+      _pendingOps.add(strokeOp);
+    }
+    _scheduleSave();
+  }
+
+  void _scheduleOutboundUploadFlush() {
+    if (_uploadFlushTimer != null) return;
+    _uploadFlushTimer = Timer(const Duration(milliseconds: 36), () {
+      _uploadFlushTimer = null;
+      flushPendingUploadsNow();
+    });
+  }
+
+  /// Flushes locally rendered CRDT operations to the sync server in a single
+  /// asynchronous batch after the local frame has already been presented.
+  void flushPendingUploadsNow() {
+    if (_disposed) return;
+    final endedId = _pendingStrokeEndId;
+    _pendingStrokeEndId = null;
+
+    if (_connectionState != SyncConnectionState.connected || _channel == null) {
+      if (_outboundOpQueue.isNotEmpty) {
+        _pendingOps.addAll(_outboundOpQueue);
+        _outboundOpQueue.clear();
+      }
+      return;
+    }
+
+    if (endedId != null) {
+      _strokeStreamSeq += 1;
+      _safeSendMessage(
+        SyncMessage.strokeStream(
+          roomId: _roomId,
+          frame: LiveStrokeFrame(
+            peerId: _peerId,
+            peerName: _displayName,
+            pageId: _activePageId,
+            strokeId: endedId,
+            kind: _pendingStrokeEndKind,
+            colorValue: _pendingStrokeEndColor,
+            strokeWidth: _pendingStrokeEndWidth,
+            points: const <StrokePoint>[],
+            seq: _strokeStreamSeq,
+            isEnd: true,
+          ),
+        ),
+      );
+    }
+
+    if (_outboundOpQueue.isEmpty) return;
+    final batch = List<CrdtOp>.from(_outboundOpQueue);
+    _outboundOpQueue.clear();
+    final sent = _safeSendMessage(
+      SyncMessage.opBatch(
+        roomId: _roomId,
+        senderId: _peerId,
+        ops: batch,
+      ),
+    );
+    if (!sent) {
+      _pendingOps.addAll(batch);
+    }
+  }
+
+  bool _flushDeferredInboundOps({required bool notify}) {
+    _deferredInboundFlushTimer?.cancel();
+    _deferredInboundFlushTimer = null;
+    if (_deferredInboundOps.isEmpty) return false;
+    final buffered = List<CrdtOp>.from(_deferredInboundOps);
+    _deferredInboundOps.clear();
+    final applied = _doc.applyOps(buffered);
+    if (applied.isEmpty) return false;
+    _ensureValidSelection();
+    _bumpCommittedInk();
+    _scheduleSave();
+    if (notify) {
+      notifyListeners();
+    }
+    return true;
+  }
+
+  void _scheduleLiveStrokeStream() {
+    if (_connectionState != SyncConnectionState.connected || _channel == null) {
+      return;
+    }
+    if (_liveStrokeStreamTimer != null) return;
+    _liveStrokeStreamTimer = Timer(const Duration(milliseconds: 85), () {
+      _liveStrokeStreamTimer = null;
+      if (_disposed || _activeStroke == null || _channel == null) return;
+      _emitStrokeStream(isEnd: false);
+    });
   }
 
   void _emitStrokeStream({required bool isEnd}) {
@@ -1906,9 +2153,9 @@ class NotebookController extends ChangeNotifier {
     _strokeStreamSeq += 1;
     final tailPoints = isEnd
         ? const <StrokePoint>[]
-        : (stroke.points.length > 180
-            ? stroke.points.sublist(stroke.points.length - 180)
-            : stroke.points);
+        : (stroke.points.length > 72
+            ? stroke.points.sublist(stroke.points.length - 72)
+            : List<StrokePoint>.from(stroke.points));
     _safeSendMessage(
       SyncMessage.strokeStream(
         roomId: _roomId,
@@ -1928,12 +2175,15 @@ class NotebookController extends ChangeNotifier {
     );
   }
 
-  void _safeSendMessage(SyncMessage msg) {
+  bool _safeSendMessage(SyncMessage msg) {
     final ch = _channel;
-    if (ch == null) return;
+    if (ch == null) return false;
     try {
       ch.sink.add(msg.encode());
-    } catch (_) {}
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   PeerPresence _buildLocalPresence({
@@ -1978,7 +2228,7 @@ class NotebookController extends ChangeNotifier {
         _laserDecayTimer?.cancel();
         _laserDecayTimer = null;
       }
-      notifyListeners();
+      _bumpLivePaint();
     });
   }
 
@@ -2055,17 +2305,22 @@ class NotebookController extends ChangeNotifier {
             _doc.applyOp(op);
           }
         }
+        _bumpCommittedInk();
       } catch (_) {}
     }
   }
 
   void _scheduleSave() {
-    if (!autoConnect && !_initialized) return;
+    if (!autoConnect) return;
     _saveTimer?.cancel();
-    _saveTimer = Timer(const Duration(milliseconds: 350), () {
-      if (!_disposed) {
-        unawaited(_saveNow());
+    _saveTimer = Timer(const Duration(milliseconds: 1200), () {
+      if (_disposed) return;
+      // Avoid encoding the full room snapshot while the stylus is mid-stroke.
+      if (_activeStroke != null) {
+        _scheduleSave();
+        return;
       }
+      unawaited(_saveNow());
     });
   }
 
@@ -2080,11 +2335,12 @@ class NotebookController extends ChangeNotifier {
         'roomId': _roomId,
       }),
     );
+    final unsentOps = <CrdtOp>[..._pendingOps, ..._outboundOpQueue];
     await _platform.writeLocalValue(
       'room_$_roomId',
       jsonEncode(<String, dynamic>{
         'snapshot': _doc.toSnapshotJson(),
-        'pendingOps': _pendingOps.map((o) => o.toJson()).toList(),
+        'pendingOps': unsentOps.map((o) => o.toJson()).toList(),
       }),
     );
   }
@@ -2105,9 +2361,13 @@ class NotebookController extends ChangeNotifier {
     _reconnectTimer?.cancel();
     _saveTimer?.cancel();
     _laserDecayTimer?.cancel();
+    _uploadFlushTimer?.cancel();
+    _liveStrokeStreamTimer?.cancel();
+    _deferredInboundFlushTimer?.cancel();
     _hostIpRefreshTimer?.cancel();
     _nearbySub?.cancel();
     _wsSub?.cancel();
+    _livePaintNotifier.dispose();
     try {
       _channel?.sink.close();
     } catch (_) {}

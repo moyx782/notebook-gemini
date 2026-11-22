@@ -39,11 +39,32 @@ class BoardStage extends StatefulWidget {
 
 class _BoardStageState extends State<BoardStage> {
   final Map<int, Offset> _touchPointers = <int, Offset>{};
+  final Map<int, int> _touchLastSeenMs = <int, int>{};
   _GestureMode _mode = _GestureMode.none;
 
   int? _activePointerId;
+  PointerDeviceKind? _activePointerKind;
   Offset? _prevLocalPos;
   int _prevTimestampMs = 0;
+
+  bool get _isStylusActive =>
+      _activePointerId != null &&
+      (_activePointerKind == PointerDeviceKind.stylus ||
+          _activePointerKind == PointerDeviceKind.invertedStylus);
+
+  void _pruneStaleTouches(int nowMs) {
+    if (_touchPointers.isEmpty) return;
+    final staleIds = <int>[];
+    _touchLastSeenMs.forEach((id, ts) {
+      if (id != _activePointerId && nowMs - ts > 6000) {
+        staleIds.add(id);
+      }
+    });
+    for (final id in staleIds) {
+      _touchPointers.remove(id);
+      _touchLastSeenMs.remove(id);
+    }
+  }
 
   // Multi-touch pinch state
   double _pinchStartDistance = 1.0;
@@ -74,13 +95,35 @@ class _BoardStageState extends State<BoardStage> {
   }
 
   void _handleOuterPointerDown(PointerDownEvent event) {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    _pruneStaleTouches(nowMs);
+
+    if (event.kind == PointerDeviceKind.stylus ||
+        event.kind == PointerDeviceKind.invertedStylus) {
+      if (_mode == _GestureMode.pinchZoom) {
+        _mode = _GestureMode.none;
+      }
+      return;
+    }
+
     if (event.kind == PointerDeviceKind.touch) {
+      if (_isStylusActive) {
+        // Ignore resting-palm touch contacts while stylus is actively writing.
+        return;
+      }
       _touchPointers[event.pointer] = event.localPosition;
+      _touchLastSeenMs[event.pointer] = nowMs;
       if (_touchPointers.length >= 2) {
-        widget.controller.cancelLocalStroke();
+        if (_mode == _GestureMode.drawStroke &&
+            widget.controller.hasSubstantialActiveStroke) {
+          widget.controller.finishLocalStroke();
+        } else {
+          widget.controller.cancelLocalStroke();
+        }
         widget.controller.cancelLocalShape();
         _mode = _GestureMode.pinchZoom;
         _activePointerId = null;
+        _activePointerKind = null;
         _initPinchAnchor();
       }
     }
@@ -90,11 +133,22 @@ class _BoardStageState extends State<BoardStage> {
     if (event.kind == PointerDeviceKind.touch &&
         _touchPointers.containsKey(event.pointer)) {
       _touchPointers[event.pointer] = event.localPosition;
+      _touchLastSeenMs[event.pointer] = DateTime.now().millisecondsSinceEpoch;
+      if (_isStylusActive) {
+        return;
+      }
       if (_touchPointers.length >= 2) {
         if (_mode != _GestureMode.pinchZoom) {
-          widget.controller.cancelLocalStroke();
+          if (_mode == _GestureMode.drawStroke &&
+              widget.controller.hasSubstantialActiveStroke) {
+            widget.controller.finishLocalStroke();
+          } else {
+            widget.controller.cancelLocalStroke();
+          }
           widget.controller.cancelLocalShape();
           _mode = _GestureMode.pinchZoom;
+          _activePointerId = null;
+          _activePointerKind = null;
           _initPinchAnchor();
         } else {
           _applyPinchUpdate();
@@ -106,6 +160,7 @@ class _BoardStageState extends State<BoardStage> {
   void _handleOuterPointerUpOrCancel(PointerEvent event) {
     if (event.kind == PointerDeviceKind.touch) {
       _touchPointers.remove(event.pointer);
+      _touchLastSeenMs.remove(event.pointer);
       if (_mode == _GestureMode.pinchZoom && _touchPointers.length < 2) {
         _mode = _GestureMode.none;
       }
@@ -166,14 +221,37 @@ class _BoardStageState extends State<BoardStage> {
   }
 
   void _handleSurfacePointerDown(PointerDownEvent event) {
-    if (_touchPointers.length >= 2 || _mode == _GestureMode.pinchZoom) {
+    final isStylus = event.kind == PointerDeviceKind.stylus ||
+        event.kind == PointerDeviceKind.invertedStylus;
+    if (!isStylus &&
+        (_touchPointers.length >= 2 || _mode == _GestureMode.pinchZoom)) {
       return;
     }
 
     final c = widget.controller;
+
+    // Prevent secondary touch/palm contacts from hijacking an active pointer;
+    // allow a hardware stylus tip to cleanly preempt an earlier palm touch.
+    if (_activePointerId != null && _activePointerId != event.pointer) {
+      if (!isStylus) {
+        return;
+      }
+      if (_mode == _GestureMode.drawStroke) {
+        if (c.hasSubstantialActiveStroke) {
+          c.finishLocalStroke();
+        } else {
+          c.cancelLocalStroke();
+        }
+      } else if (_mode == _GestureMode.drawShape) {
+        c.cancelLocalShape();
+      }
+      _draggingElementId = null;
+    }
+
     final scenePos = _toScene(event.localPosition);
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     _activePointerId = event.pointer;
+    _activePointerKind = event.kind;
     _prevLocalPos = event.localPosition;
     _prevTimestampMs = nowMs;
 
@@ -256,10 +334,11 @@ class _BoardStageState extends State<BoardStage> {
   }
 
   void _handleSurfacePointerMove(PointerMoveEvent event) {
-    if (_touchPointers.length >= 2 || _mode == _GestureMode.pinchZoom) {
+    if (!_isStylusActive &&
+        (_touchPointers.length >= 2 || _mode == _GestureMode.pinchZoom)) {
       return;
     }
-    if (_activePointerId != null && event.pointer != _activePointerId) {
+    if (_activePointerId == null || event.pointer != _activePointerId) {
       return;
     }
 
@@ -319,7 +398,7 @@ class _BoardStageState extends State<BoardStage> {
   }
 
   void _handleSurfacePointerUpOrCancel(PointerEvent event) {
-    if (_activePointerId != null && event.pointer != _activePointerId) {
+    if (_activePointerId == null || event.pointer != _activePointerId) {
       return;
     }
 
@@ -327,6 +406,22 @@ class _BoardStageState extends State<BoardStage> {
     switch (_mode) {
       case _GestureMode.drawStroke:
         if (event is PointerUpEvent) {
+          if (_prevLocalPos != null &&
+              (event.localPosition - _prevLocalPos!).distance > 0.35) {
+            final nowMs = DateTime.now().millisecondsSinceEpoch;
+            final dtMs = math.max(1, nowMs - _prevTimestampMs);
+            final pressure =
+                computeEffectivePressure(event, _prevLocalPos, dtMs);
+            c.appendLocalStrokePoint(
+              _toScene(event.localPosition),
+              pressure: pressure,
+              dtMs: dtMs,
+            );
+          }
+          c.finishLocalStroke();
+        } else if (c.hasSubstantialActiveStroke) {
+          // Preserve intentional handwriting if OS/browser fires pointercancel
+          // mid-stroke instead of flashing and deleting the user's ink.
           c.finishLocalStroke();
         } else {
           c.cancelLocalStroke();
@@ -334,6 +429,7 @@ class _BoardStageState extends State<BoardStage> {
         break;
       case _GestureMode.drawShape:
         if (event is PointerUpEvent) {
+          c.updateLocalShape(_toScene(event.localPosition));
           c.finishLocalShape();
         } else {
           c.cancelLocalShape();
@@ -361,6 +457,7 @@ class _BoardStageState extends State<BoardStage> {
     }
 
     _activePointerId = null;
+    _activePointerKind = null;
     _prevLocalPos = null;
     if (_mode != _GestureMode.pinchZoom) {
       _mode = _GestureMode.none;
@@ -404,6 +501,7 @@ class _BoardStageState extends State<BoardStage> {
 
             return ClipRect(
               child: Listener(
+                key: const ValueKey<String>('outer-board-listener'),
                 behavior: HitTestBehavior.translucent,
                 onPointerDown: _handleOuterPointerDown,
                 onPointerMove: _handleOuterPointerMove,
@@ -441,7 +539,9 @@ class _BoardStageState extends State<BoardStage> {
 
                       // Layer 2: Canvas drawing / erasing / stroke-selection surface
                       Positioned.fill(
+                        key: const ValueKey<String>('surface-board-listener-pos'),
                         child: Listener(
+                          key: const ValueKey<String>('surface-board-listener'),
                           behavior: HitTestBehavior.opaque,
                           onPointerDown: _handleSurfacePointerDown,
                           onPointerMove: _handleSurfacePointerMove,
@@ -466,6 +566,7 @@ class _BoardStageState extends State<BoardStage> {
                               panOffset: c.panOffset,
                               zoom: c.zoom,
                               selectedElementId: c.selectedElementId,
+                              revision: c.committedInkRevision,
                               paintPaper: false,
                               paintInk: true,
                             ),
@@ -479,14 +580,7 @@ class _BoardStageState extends State<BoardStage> {
                         child: RepaintBoundary(
                           child: CustomPaint(
                             painter: LiveOverlayPainter(
-                              activePageId: c.activePageId,
-                              panOffset: c.panOffset,
-                              zoom: c.zoom,
-                              activeStroke: c.activeStroke,
-                              activeShape: c.activeShape,
-                              remoteLiveStrokes: c.remoteLiveStrokes,
-                              laserTrails: c.laserTrails,
-                              remotePeers: c.remotePeers,
+                              controller: c,
                             ),
                           ),
                         ),

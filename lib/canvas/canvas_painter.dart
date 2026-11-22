@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -6,6 +7,47 @@ import 'package:notebook_core/notebook_core.dart';
 import '../state/notebook_controller.dart';
 import 'stroke_geometry.dart';
 
+final LinkedHashMap<String, Path> _strokePathCache =
+    LinkedHashMap<String, Path>();
+
+Path _cachedStrokeRibbonPath(CanvasElementModel el) {
+  final key =
+      's:${el.id}:${el.x.toStringAsFixed(2)}:${el.y.toStringAsFixed(2)}:${el.strokeWidth.toStringAsFixed(2)}:${el.points.length}';
+  final hit = _strokePathCache.remove(key);
+  if (hit != null) {
+    _strokePathCache[key] = hit;
+    return hit;
+  }
+  final built = buildVariableWidthStrokePath(
+    el.points,
+    el.strokeWidth,
+    originX: el.x,
+    originY: el.y,
+  );
+  if (_strokePathCache.length >= 1024) {
+    _strokePathCache.remove(_strokePathCache.keys.first);
+  }
+  _strokePathCache[key] = built;
+  return built;
+}
+
+Path _cachedHighlighterPath(CanvasElementModel el) {
+  final key =
+      'h:${el.id}:${el.x.toStringAsFixed(2)}:${el.y.toStringAsFixed(2)}:${el.points.length}';
+  final hit = _strokePathCache.remove(key);
+  if (hit != null) {
+    _strokePathCache[key] = hit;
+    return hit;
+  }
+  final pts = el.points.map((p) => Offset(el.x + p.dx, el.y + p.dy)).toList();
+  final built = buildSmoothCenterlinePath(pts);
+  if (_strokePathCache.length >= 1024) {
+    _strokePathCache.remove(_strokePathCache.keys.first);
+  }
+  _strokePathCache[key] = built;
+  return built;
+}
+
 class CommittedCanvasPainter extends CustomPainter {
   const CommittedCanvasPainter({
     required this.page,
@@ -13,6 +55,7 @@ class CommittedCanvasPainter extends CustomPainter {
     required this.panOffset,
     required this.zoom,
     required this.selectedElementId,
+    this.revision = 0,
     this.paintPaper = true,
     this.paintInk = true,
   });
@@ -22,6 +65,7 @@ class CommittedCanvasPainter extends CustomPainter {
   final Offset panOffset;
   final double zoom;
   final String? selectedElementId;
+  final int revision;
   final bool paintPaper;
   final bool paintInk;
 
@@ -201,12 +245,7 @@ class CommittedCanvasPainter extends CustomPainter {
   }
 
   void _paintStroke(Canvas canvas, CanvasElementModel el) {
-    final path = buildVariableWidthStrokePath(
-      el.points,
-      el.strokeWidth,
-      originX: el.x,
-      originY: el.y,
-    );
+    final path = _cachedStrokeRibbonPath(el);
     canvas.drawPath(
       path,
       Paint()
@@ -217,10 +256,7 @@ class CommittedCanvasPainter extends CustomPainter {
   }
 
   void _paintHighlighter(Canvas canvas, CanvasElementModel el) {
-    final pts = el.points
-        .map((p) => Offset(el.x + p.dx, el.y + p.dy))
-        .toList();
-    final path = buildSmoothCenterlinePath(pts);
+    final path = _cachedHighlighterPath(el);
     canvas.drawPath(
       path,
       Paint()
@@ -280,7 +316,28 @@ class CommittedCanvasPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CommittedCanvasPainter oldDelegate) {
-    return true;
+    if (paintPaper != oldDelegate.paintPaper ||
+        paintInk != oldDelegate.paintInk ||
+        panOffset != oldDelegate.panOffset ||
+        zoom != oldDelegate.zoom) {
+      return true;
+    }
+    if (paintPaper) {
+      if (page?.id != oldDelegate.page?.id ||
+          page?.background != oldDelegate.page?.background ||
+          page?.backgroundColorValue != oldDelegate.page?.backgroundColorValue) {
+        return true;
+      }
+    }
+    if (paintInk) {
+      if (revision != oldDelegate.revision ||
+          page?.id != oldDelegate.page?.id ||
+          selectedElementId != oldDelegate.selectedElementId ||
+          elements.length != oldDelegate.elements.length) {
+        return true;
+      }
+    }
+    return false;
   }
 }
 
@@ -393,28 +450,23 @@ void paintShapeGeometry({
 }
 
 class LiveOverlayPainter extends CustomPainter {
-  const LiveOverlayPainter({
-    required this.activePageId,
-    required this.panOffset,
-    required this.zoom,
-    required this.activeStroke,
-    required this.activeShape,
-    required this.remoteLiveStrokes,
-    required this.laserTrails,
-    required this.remotePeers,
-  });
+  LiveOverlayPainter({
+    required this.controller,
+  }) : super(repaint: controller.livePaintListenable);
 
-  final String activePageId;
-  final Offset panOffset;
-  final double zoom;
-  final ActiveStrokePreview? activeStroke;
-  final ActiveShapePreview? activeShape;
-  final Map<String, LiveStrokeFrame> remoteLiveStrokes;
-  final Map<String, LaserTrailState> laserTrails;
-  final List<PeerPresence> remotePeers;
+  final NotebookController controller;
 
   @override
   void paint(Canvas canvas, Size size) {
+    final activePageId = controller.activePageId;
+    final panOffset = controller.panOffset;
+    final zoom = controller.zoom;
+    final activeStroke = controller.activeStroke;
+    final activeShape = controller.activeShape;
+    final remoteLiveStrokes = controller.remoteLiveStrokes;
+    final laserTrails = controller.laserTrails;
+    final remotePeers = controller.remotePeersMap.values;
+
     canvas.save();
     canvas.translate(panOffset.dx, panOffset.dy);
     canvas.scale(zoom, zoom);
@@ -506,6 +558,7 @@ class LiveOverlayPainter extends CustomPainter {
         tip + const Offset(10, -18),
         '${frame.peerName} 正在书写',
         Color(frame.colorValue),
+        zoom,
       );
     }
 
@@ -580,6 +633,7 @@ class LiveOverlayPainter extends CustomPainter {
         pos + Offset(14 / zoom, 16 / zoom),
         '${peer.displayName} · ${peer.formFactor.label}',
         peerColor,
+        zoom,
       );
     }
 
@@ -591,6 +645,7 @@ class LiveOverlayPainter extends CustomPainter {
     Offset pos,
     String text,
     Color bgColor,
+    double zoom,
   ) {
     final scale = 1.0 / zoom;
     canvas.save();
@@ -620,6 +675,6 @@ class LiveOverlayPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant LiveOverlayPainter oldDelegate) {
-    return true;
+    return !identical(controller, oldDelegate.controller);
   }
 }
