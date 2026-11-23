@@ -9,6 +9,7 @@ import 'connect_qr_dialog.dart';
 import 'mindflow_ai_dialog.dart';
 import 'notebook_sidebar.dart';
 import 'peer_presence_bar.dart';
+import 'voice_memo_overlay.dart';
 
 enum _ShellMode { desktop, tablet, phone }
 
@@ -180,6 +181,9 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
         return KeyEventResult.handled;
       case LogicalKeyboardKey.keyL:
         c.setTool(CanvasTool.laser);
+        return KeyEventResult.handled;
+      case LogicalKeyboardKey.keyU:
+        c.toggleVoiceMemo();
         return KeyEventResult.handled;
       default:
         return KeyEventResult.ignored;
@@ -472,8 +476,17 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
                                               showImportPdfDialog(context, c),
                                           onOpenMindFlowAi: () =>
                                               showMindFlowAiDialog(context, c),
+                                          onToggleVoiceMemo: c.toggleVoiceMemo,
                                         ),
                                       ),
+
+                                      // Non-blocking floating Voice Memo studio
+                                      if (c.voiceMemoOpen)
+                                        VoiceMemoFloatingPanel(
+                                          controller: c,
+                                          stageSize: stageSize,
+                                          compact: mode == _ShellMode.phone,
+                                        ),
 
                                       // Zoom control pill (Desktop & Tablet)
                                       if (mode != _ShellMode.phone)
@@ -790,6 +803,8 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
             onSelected: (value) {
               if (value == 'import_pdf') {
                 showImportPdfDialog(context, c);
+              } else if (value == 'voice_memo') {
+                c.openVoiceMemo();
               } else if (value == 'mindflow_ai') {
                 showMindFlowAiDialog(context, c);
               } else if (value == 'mindflow_layout') {
@@ -841,6 +856,20 @@ class _AdaptiveNotebookShellState extends State<AdaptiveNotebookShell> {
                     ],
                   ),
                 ),
+              const PopupMenuItem<String>(
+                value: 'voice_memo',
+                child: Row(
+                  children: <Widget>[
+                    Icon(
+                      Icons.mic_none_rounded,
+                      size: 18,
+                      color: Color(0xFF4F46E5),
+                    ),
+                    SizedBox(width: 8),
+                    Text('语音备忘录（实时转文字）'),
+                  ],
+                ),
+              ),
               const PopupMenuItem<String>(
                 value: 'mindflow_ai',
                 child: Row(

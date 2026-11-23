@@ -1,5 +1,7 @@
+import AVFoundation
 import CoreBluetooth
 import Flutter
+import Speech
 import UIKit
 
 @main
@@ -42,6 +44,13 @@ private final class SyncCanvasIosBleBridge: NSObject, CBCentralManagerDelegate, 
   private var peripheralRssi: [UUID: Int] = [:]
   private var lastReadAt: [UUID: Date] = [:]
 
+  private var audioEngine: AVAudioEngine?
+  private var speechRecognizer: SFSpeechRecognizer?
+  private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+  private var recognitionTask: SFSpeechRecognitionTask?
+  private var wantsSpeechListening = false
+  private var lastSpeechEmitAt = Date.distantPast
+
   init(channel: FlutterMethodChannel) {
     self.channel = channel
     super.init()
@@ -70,6 +79,13 @@ private final class SyncCanvasIosBleBridge: NSObject, CBCentralManagerDelegate, 
       result(["ok": false, "error": "仅 Android 原生端支持自动热点切换"])
     case "getAppFilesDir", "pickImage", "scanQrCode":
       result(nil)
+    case "startSpeechRecognition":
+      let args = call.arguments as? [String: Any]
+      let locale = args?["locale"] as? String ?? "zh-CN"
+      startSpeechRecognition(localeId: locale, result: result)
+    case "stopSpeechRecognition":
+      stopSpeechRecognition()
+      result(true)
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -317,5 +333,187 @@ private final class SyncCanvasIosBleBridge: NSObject, CBCentralManagerDelegate, 
       )
     }
     centralManager?.cancelPeripheralConnection(peripheral)
+  }
+
+  // MARK: - Live Speech-to-Text Bridge (iOS / iPadOS)
+
+  private func emitSpeechEvent(_ payload: [String: Any]) {
+    DispatchQueue.main.async { [weak self] in
+      self?.channel.invokeMethod("onSpeechEvent", arguments: payload)
+    }
+  }
+
+  private func startSpeechRecognition(localeId: String, result: @escaping FlutterResult) {
+    guard #available(iOS 10.0, *) else {
+      result([
+        "ok": false,
+        "manualRequired": true,
+        "error": "需要 iOS 10 或更高版本才支持系统语音听写",
+      ])
+      return
+    }
+    wantsSpeechListening = true
+    SFSpeechRecognizer.requestAuthorization { [weak self] status in
+      DispatchQueue.main.async {
+        guard let self = self, self.wantsSpeechListening else { return }
+        guard status == .authorized else {
+          self.wantsSpeechListening = false
+          result([
+            "ok": false,
+            "manualRequired": true,
+            "error": "请在「系统设置」中授予本应用语音识别权限",
+          ])
+          return
+        }
+        AVAudioSession.sharedInstance().requestRecordPermission { granted in
+          DispatchQueue.main.async {
+            guard self.wantsSpeechListening else { return }
+            if granted {
+              self.beginIosSpeechSession(localeId: localeId, result: result)
+            } else {
+              self.wantsSpeechListening = false
+              result([
+                "ok": false,
+                "manualRequired": true,
+                "error": "请在「系统设置」中授予麦克风权限",
+              ])
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @available(iOS 10.0, *)
+  private func beginIosSpeechSession(localeId: String, result: @escaping FlutterResult) {
+    stopSpeechRecognition(keepWantedFlag: true)
+    let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeId))
+      ?? SFSpeechRecognizer()
+    guard let rec = recognizer, rec.isAvailable else {
+      wantsSpeechListening = false
+      result([
+        "ok": false,
+        "manualRequired": true,
+        "error": "当前系统语音识别服务不可用，可使用系统键盘听写录入",
+      ])
+      return
+    }
+
+    do {
+      let session = AVAudioSession.sharedInstance()
+      try session.setCategory(.playAndRecord, mode: .measurement, options: [.duckOthers, .defaultToSpeaker])
+      try session.setActive(true, options: .notifyOthersOnDeactivation)
+    } catch {
+      wantsSpeechListening = false
+      result([
+        "ok": false,
+        "manualRequired": true,
+        "error": "音频会话初始化失败: \(error.localizedDescription)",
+      ])
+      return
+    }
+
+    let engine = AVAudioEngine()
+    let request = SFSpeechAudioBufferRecognitionRequest()
+    request.shouldReportPartialResults = true
+    let inputNode = engine.inputNode
+    let format = inputNode.outputFormat(forBus: 0)
+    guard format.channelCount > 0 && format.sampleRate > 0 else {
+      wantsSpeechListening = false
+      result([
+        "ok": false,
+        "manualRequired": true,
+        "error": "未检测到可用麦克风输入",
+      ])
+      return
+    }
+
+    inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self, weak request] buffer, _ in
+      request?.append(buffer)
+      guard let self = self else { return }
+      let now = Date()
+      if now.timeIntervalSince(self.lastSpeechEmitAt) >= 0.09,
+         let channelData = buffer.floatChannelData?[0] {
+        self.lastSpeechEmitAt = now
+        let count = Int(buffer.frameLength)
+        if count > 0 {
+          var sum: Float = 0
+          for idx in 0..<count {
+            let v = channelData[idx]
+            sum += v * v
+          }
+          let rms = sqrt(sum / Float(count))
+          let level = min(1.0, max(0.0, Double(rms * 8.0)))
+          self.emitSpeechEvent(["type": "level", "level": level])
+        }
+      }
+    }
+
+    do {
+      engine.prepare()
+      try engine.start()
+    } catch {
+      inputNode.removeTap(onBus: 0)
+      wantsSpeechListening = false
+      result([
+        "ok": false,
+        "manualRequired": true,
+        "error": "无法开启麦克风引擎: \(error.localizedDescription)",
+      ])
+      return
+    }
+
+    speechRecognizer = rec
+    audioEngine = engine
+    recognitionRequest = request
+    emitSpeechEvent(["type": "status", "status": "listening"])
+
+    var latestSent = ""
+    recognitionTask = rec.recognitionTask(with: request) { [weak self] speechResult, error in
+      guard let self = self else { return }
+      if let res = speechResult {
+        let text = res.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty {
+          latestSent = text
+          if res.isFinal {
+            self.emitSpeechEvent(["type": "finalized", "text": text])
+            latestSent = ""
+          } else {
+            self.emitSpeechEvent(["type": "partial", "text": text])
+          }
+        }
+      }
+      if error != nil || (speechResult?.isFinal ?? false) {
+        if !latestSent.isEmpty {
+          self.emitSpeechEvent(["type": "finalized", "text": latestSent])
+          latestSent = ""
+        }
+        if !self.wantsSpeechListening {
+          self.emitSpeechEvent(["type": "status", "status": "stopped"])
+        }
+      }
+    }
+    result(["ok": true])
+  }
+
+  private func stopSpeechRecognition(keepWantedFlag: Bool = false) {
+    if !keepWantedFlag {
+      wantsSpeechListening = false
+    }
+    recognitionRequest?.endAudio()
+    recognitionTask?.cancel()
+    if let engine = audioEngine {
+      if engine.isRunning {
+        engine.stop()
+      }
+      engine.inputNode.removeTap(onBus: 0)
+    }
+    audioEngine = nil
+    recognitionRequest = nil
+    recognitionTask = nil
+    speechRecognizer = nil
+    if !keepWantedFlag {
+      try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
   }
 }

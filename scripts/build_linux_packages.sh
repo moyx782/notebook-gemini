@@ -126,7 +126,7 @@ Architecture: $DEB_ARCH
 Installed-Size: $INSTALLED_SIZE
 Maintainer: SyncCanvas <noreply@github.com>
 Depends: libgtk-3-0 (>= 3.18) | libgtk-3-0t64, libglib2.0-0 (>= 2.50) | libglib2.0-0t64, libc6
-Recommends: poppler-utils, zenity
+Recommends: poppler-utils, zenity, pipewire-bin | pulseaudio-utils | alsa-utils, bzip2, tar
 Homepage: https://github.com/moyx782/notebook-gemini
 Description: SyncCanvas Notebook - cross-platform real-time shared whiteboard
  Multi-page handwriting and whiteboard notebook with HLC-CRDT real-time sync,
@@ -174,6 +174,7 @@ License:        MIT
 URL:            https://github.com/moyx782/notebook-gemini
 AutoReqProv:    no
 Requires:       gtk3
+Recommends:     poppler-utils, zenity, bzip2, tar, alsa-utils
 
 %description
 Multi-page handwriting and whiteboard notebook with HLC-CRDT real-time sync,

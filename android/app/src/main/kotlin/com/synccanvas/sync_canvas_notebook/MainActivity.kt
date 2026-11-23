@@ -1,7 +1,9 @@
 package com.synccanvas.sync_canvas_notebook
 
+import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -11,9 +13,15 @@ import android.graphics.pdf.PdfRenderer
 import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.util.Base64
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -34,20 +42,28 @@ class MainActivity : FlutterActivity() {
         private const val REQ_PICK_IMAGE = 9101
         private const val REQ_SCAN_QR = 9102
         private const val REQ_PICK_PDF = 9103
+        private const val REQ_RECORD_AUDIO = 9104
         private const val MAX_IMAGE_DIM = 1600
         private const val MAX_PDF_DIM = 1440
     }
 
     private val ioExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var bridgeChannel: MethodChannel? = null
     private var pendingImageResult: MethodChannel.Result? = null
     private var pendingQrResult: MethodChannel.Result? = null
     private var pendingPdfResult: MethodChannel.Result? = null
     private var pendingPdfMaxPages: Int = 30
+    private var pendingSpeechResult: MethodChannel.Result? = null
+    private var pendingSpeechLocale: String = "zh-CN"
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var wantsSpeechListening = false
     private var nearbyManager: NearbyBootstrapManager? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        bridgeChannel = channel
         val manager = NearbyBootstrapManager(this, channel)
         nearbyManager = manager
 
@@ -114,6 +130,14 @@ class MainActivity : FlutterActivity() {
                     manager.openSystemHotspotSettings()
                     result.success(true)
                 }
+                "startSpeechRecognition" -> {
+                    val locale = call.argument<String>("locale") ?: "zh-CN"
+                    startSpeechRecognitionWithPermission(locale, result)
+                }
+                "stopSpeechRecognition" -> {
+                    stopSpeechRecognitionInternal()
+                    result.success(true)
+                }
                 else -> result.notImplemented()
             }
         }
@@ -125,7 +149,163 @@ class MainActivity : FlutterActivity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_RECORD_AUDIO) {
+            val cb = pendingSpeechResult
+            pendingSpeechResult = null
+            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                beginSpeechRecognizerOnMain(pendingSpeechLocale, cb)
+            } else {
+                cb?.success(
+                    mapOf(
+                        "ok" to false,
+                        "manualRequired" to true,
+                        "error" to "需要麦克风权限才能进行实时语音转写"
+                    )
+                )
+            }
+            return
+        }
         nearbyManager?.onRequestPermissionsResult(requestCode, grantResults)
+    }
+
+    private fun emitSpeechEvent(payload: Map<String, Any?>) {
+        mainHandler.post {
+            bridgeChannel?.invokeMethod("onSpeechEvent", payload)
+        }
+    }
+
+    private fun startSpeechRecognitionWithPermission(locale: String, result: MethodChannel.Result) {
+        pendingSpeechLocale = locale
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+            checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingSpeechResult?.success(
+                mapOf("ok" to false, "error" to "权限请求已取消")
+            )
+            pendingSpeechResult = result
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_RECORD_AUDIO)
+            return
+        }
+        beginSpeechRecognizerOnMain(locale, result)
+    }
+
+    private fun beginSpeechRecognizerOnMain(locale: String, result: MethodChannel.Result?) {
+        mainHandler.post {
+            if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                result?.success(
+                    mapOf(
+                        "ok" to false,
+                        "manualRequired" to true,
+                        "error" to "当前系统未安装或启用语音识别服务，可使用系统语音输入法录入并自动成稿"
+                    )
+                )
+                return@post
+            }
+
+            destroyRecognizerImmediateOnMain()
+            wantsSpeechListening = true
+            pendingSpeechLocale = locale
+
+            val recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+            speechRecognizer = recognizer
+            recognizer.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {
+                    emitSpeechEvent(mapOf("type" to "status", "status" to "listening"))
+                }
+
+                override fun onBeginningOfSpeech() {}
+
+                override fun onRmsChanged(rmsdB: Float) {
+                    val norm = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f).toDouble()
+                    emitSpeechEvent(mapOf("type" to "level", "level" to norm))
+                }
+
+                override fun onBufferReceived(buffer: ByteArray?) {}
+
+                override fun onEndOfSpeech() {}
+
+                override fun onError(error: Int) {
+                    if (!wantsSpeechListening) return
+                    val retryable = error == SpeechRecognizer.ERROR_NO_MATCH ||
+                        error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+                        error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+                    if (retryable) {
+                        mainHandler.postDelayed({ startNextRecognitionCycle() }, 180)
+                        return
+                    }
+                    emitSpeechEvent(
+                        mapOf(
+                            "type" to "error",
+                            "error" to when (error) {
+                                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "请开启系统麦克风权限"
+                                SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
+                                    "在线语音识别网络不可用，请检查网络或下载系统离线语音包"
+                                else -> "语音识别中断 (code=$error)"
+                            }
+                        )
+                    )
+                }
+
+                override fun onResults(results: Bundle?) {
+                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val top = matches?.firstOrNull()?.trim().orEmpty()
+                    if (top.isNotEmpty()) {
+                        emitSpeechEvent(mapOf("type" to "finalized", "text" to top))
+                    } else {
+                        emitSpeechEvent(mapOf("type" to "partial", "text" to ""))
+                    }
+                    if (wantsSpeechListening) {
+                        mainHandler.postDelayed({ startNextRecognitionCycle() }, 120)
+                    }
+                }
+
+                override fun onPartialResults(partialResults: Bundle?) {
+                    val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val top = matches?.firstOrNull()?.trim().orEmpty()
+                    if (top.isNotEmpty()) {
+                        emitSpeechEvent(mapOf("type" to "partial", "text" to top))
+                    }
+                }
+
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+            })
+
+            startNextRecognitionCycle()
+            result?.success(mapOf("ok" to true))
+        }
+    }
+
+    private fun startNextRecognitionCycle() {
+        if (!wantsSpeechListening) return
+        val recognizer = speechRecognizer ?: return
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, pendingSpeechLocale)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        }
+        try {
+            recognizer.startListening(intent)
+        } catch (_: Exception) {}
+    }
+
+    private fun destroyRecognizerImmediateOnMain() {
+        try {
+            speechRecognizer?.stopListening()
+        } catch (_: Exception) {}
+        try {
+            speechRecognizer?.destroy()
+        } catch (_: Exception) {}
+        speechRecognizer = null
+    }
+
+    private fun stopSpeechRecognitionInternal(resetIntentOnly: Boolean = false) {
+        wantsSpeechListening = false
+        if (resetIntentOnly) return
+        mainHandler.post {
+            destroyRecognizerImmediateOnMain()
+        }
     }
 
     private fun launchImagePicker() {
@@ -430,6 +610,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        stopSpeechRecognitionInternal()
         nearbyManager?.dispose()
         nearbyManager = null
         ioExecutor.shutdownNow()

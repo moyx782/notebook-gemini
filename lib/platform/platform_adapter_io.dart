@@ -8,15 +8,23 @@ import 'package:sync_canvas_server/lan_info.dart';
 import 'package:sync_canvas_server/sync_hub.dart';
 import 'package:sync_canvas_server/udp_discovery.dart';
 
+import 'linux_local_asr.dart';
 import 'platform_adapter_stub.dart';
 export 'platform_adapter_stub.dart'
     show
         HotspotStartOutcome,
         HttpResponseData,
+        LocalAsrDownloadProgress,
+        LocalAsrEngineKind,
+        LocalAsrModelPreset,
+        LocalAsrStatus,
         OperationOutcome,
         PdfImportedDocument,
         PdfRenderedPage,
-        PlatformAdapter;
+        PlatformAdapter,
+        VoiceSpeechEvent,
+        VoiceSpeechEventType,
+        kLinuxAsrModelPresets;
 
 /// Resolves the offline Flutter Web bundle directory for the embedded host
 /// server by checking explicit overrides, bundled app paths, and repository
@@ -94,6 +102,8 @@ class IoPlatformAdapter implements PlatformAdapter {
 
   final StreamController<NearbyBoardBeacon> _nearbyController =
       StreamController<NearbyBoardBeacon>.broadcast();
+  final StreamController<VoiceSpeechEvent> _speechController =
+      StreamController<VoiceSpeechEvent>.broadcast();
 
   Directory? _cacheDir;
   SyncServer? _embeddedServer;
@@ -102,12 +112,24 @@ class IoPlatformAdapter implements PlatformAdapter {
   NearbyBoardBeacon? _latestHostBeacon;
   bool _hostUdpActive = false;
   bool _handlerBound = false;
+  Process? _winSpeechProc;
+  bool _winSpeechStopping = false;
+  LinuxLocalAsrRunner? _linuxAsrRunner;
 
   void _ensureMethodCallHandler() {
     if (_handlerBound) return;
     _handlerBound = true;
     try {
       _channel.setMethodCallHandler((MethodCall call) async {
+        if (call.method == 'onSpeechEvent') {
+          final args = call.arguments;
+          if (args is Map && !_speechController.isClosed) {
+            _speechController.add(
+              VoiceSpeechEvent.fromJson(Map<String, dynamic>.from(args)),
+            );
+          }
+          return;
+        }
         if (call.method == 'onBleBeaconDiscovered') {
           final args = call.arguments;
           if (args is Map) {
@@ -244,7 +266,16 @@ class IoPlatformAdapter implements PlatformAdapter {
   bool get canManageHotspot => Platform.isAndroid;
 
   @override
+  bool get canTranscribeSpeech => true;
+
+  @override
+  bool get supportsLocalAsrModels => Platform.isLinux;
+
+  @override
   Stream<NearbyBoardBeacon> get nearbyBeacons => _nearbyController.stream;
+
+  @override
+  Stream<VoiceSpeechEvent> get speechEvents => _speechController.stream;
 
   @override
   String defaultWsUrl() => 'ws://127.0.0.1:8787/ws';
@@ -324,15 +355,21 @@ class IoPlatformAdapter implements PlatformAdapter {
   }
 
   @override
-  Future<HttpResponseData?> httpPostJson(Uri uri, String jsonBody) async {
+  Future<HttpResponseData?> httpPostJson(
+    Uri uri,
+    String jsonBody, {
+    Map<String, String>? headers,
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
     final client = HttpClient();
-    client.connectionTimeout = const Duration(seconds: 6);
+    client.connectionTimeout = timeout;
     try {
-      final req = await client.postUrl(uri);
+      final req = await client.postUrl(uri).timeout(timeout);
       req.headers.contentType = ContentType.json;
+      headers?.forEach((k, v) => req.headers.set(k, v));
       req.write(jsonBody);
-      final resp = await req.close();
-      final body = await utf8.decoder.bind(resp).join();
+      final resp = await req.close().timeout(timeout);
+      final body = await utf8.decoder.bind(resp).join().timeout(timeout);
       return HttpResponseData(statusCode: resp.statusCode, body: body);
     } catch (_) {
       return null;
@@ -1044,7 +1081,209 @@ try {
   }
 
   @override
+  Future<OperationOutcome> startSpeechRecognition({
+    String localeId = 'zh-CN',
+    String? localModelPath,
+    String? localRuntimePath,
+  }) async {
+    _ensureMethodCallHandler();
+    if (Platform.isAndroid || Platform.isMacOS || Platform.isIOS) {
+      try {
+        final resp = await _channel.invokeMethod<dynamic>(
+          'startSpeechRecognition',
+          <String, Object?>{'locale': localeId},
+        );
+        if (resp is Map) {
+          return OperationOutcome(
+            ok: resp['ok'] as bool? ?? false,
+            error: resp['error'] as String?,
+            manualRequired: resp['manualRequired'] as bool? ?? false,
+          );
+        }
+        return const OperationOutcome(ok: true);
+      } catch (e) {
+        return OperationOutcome(ok: false, error: '启动语音识别失败: $e');
+      }
+    }
+
+    if (Platform.isLinux) {
+      _linuxAsrRunner ??= LinuxLocalAsrRunner(
+        onEvent: (event) {
+          if (!_speechController.isClosed) {
+            _speechController.add(event);
+          }
+        },
+      );
+      return _linuxAsrRunner!.start(
+        localeId: localeId,
+        customModelPath: localModelPath,
+        customRuntimePath: localRuntimePath,
+      );
+    }
+
+    if (Platform.isWindows) {
+      return _startWindowsSpeechRecognition(localeId: localeId);
+    }
+
+    return const OperationOutcome(
+      ok: false,
+      manualRequired: true,
+      error: '当前桌面环境未内置系统听写引擎，可使用系统语音输入法或在下方速记框录入后自动整理成完整文字备忘。',
+    );
+  }
+
+  Future<OperationOutcome> _startWindowsSpeechRecognition({
+    required String localeId,
+  }) async {
+    await stopSpeechRecognition();
+    _winSpeechStopping = false;
+    final safeLocale = localeId.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '');
+    final script = r'''
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+  Add-Type -AssemblyName System.Speech
+  $culture = $null
+  $target = '__LOCALE__'
+  if (-not [string]::IsNullOrWhiteSpace($target)) {
+    try { $culture = New-Object System.Globalization.CultureInfo($target) } catch {}
+  }
+  $rec = $null
+  if ($culture -ne $null) {
+    try { $rec = New-Object System.Speech.Recognition.SpeechRecognitionEngine($culture) } catch {}
+  }
+  if ($rec -eq $null) {
+    $rec = New-Object System.Speech.Recognition.SpeechRecognitionEngine
+  }
+  $rec.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
+  $rec.SetInputToDefaultAudioDevice()
+  Register-ObjectEvent -InputObject $rec -EventName SpeechHypothesized -Action {
+    $txt = $EventArgs.Result.Text
+    if (-not [string]::IsNullOrWhiteSpace($txt)) {
+      [Console]::WriteLine((@{ type = 'partial'; text = $txt } | ConvertTo-Json -Compress))
+    }
+  } | Out-Null
+  Register-ObjectEvent -InputObject $rec -EventName SpeechRecognized -Action {
+    $txt = $EventArgs.Result.Text
+    if (-not [string]::IsNullOrWhiteSpace($txt)) {
+      [Console]::WriteLine((@{ type = 'finalized'; text = $txt } | ConvertTo-Json -Compress))
+    }
+  } | Out-Null
+  Register-ObjectEvent -InputObject $rec -EventName AudioLevelUpdated -Action {
+    $lvl = [Math]::Min(1.0, [Math]::Max(0.0, ($EventArgs.AudioLevel / 100.0)))
+    [Console]::WriteLine((@{ type = 'level'; level = [Math]::Round($lvl, 2) } | ConvertTo-Json -Compress))
+  } | Out-Null
+  $rec.RecognizeAsync([System.Speech.Recognition.RecognizeMode]::Multiple)
+  [Console]::WriteLine((@{ type = 'status'; status = 'listening' } | ConvertTo-Json -Compress))
+  while ($true) { Start-Sleep -Milliseconds 250 }
+} catch {
+  [Console]::WriteLine((@{ type = 'error'; error = $_.Exception.Message } | ConvertTo-Json -Compress))
+}
+'''
+        .replaceAll('__LOCALE__', safeLocale);
+    try {
+      final proc = await Process.start(
+        'powershell.exe',
+        <String>['-NoProfile', '-NonInteractive', '-Command', script],
+      );
+      _winSpeechProc = proc;
+      proc.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) {
+        final trimmed = line.trim();
+        if (trimmed.isEmpty || _speechController.isClosed) return;
+        try {
+          final parsed = jsonDecode(trimmed);
+          if (parsed is Map) {
+            _speechController.add(
+              VoiceSpeechEvent.fromJson(Map<String, dynamic>.from(parsed)),
+            );
+          }
+        } catch (_) {}
+      });
+      proc.stderr.drain<void>();
+      unawaited(
+        proc.exitCode.then((_) {
+          if (identical(_winSpeechProc, proc)) {
+            _winSpeechProc = null;
+          }
+          if (!_winSpeechStopping && !_speechController.isClosed) {
+            _speechController.add(
+              const VoiceSpeechEvent(
+                type: VoiceSpeechEventType.status,
+                status: 'stopped',
+              ),
+            );
+          }
+        }),
+      );
+      return const OperationOutcome(ok: true);
+    } catch (e) {
+      return OperationOutcome(
+        ok: false,
+        manualRequired: true,
+        error: '无法启动 Windows 语音识别，请在系统设置开启语音识别或直接用 Win+H 系统听写: $e',
+      );
+    }
+  }
+
+  @override
+  Future<void> stopSpeechRecognition() async {
+    if (Platform.isAndroid || Platform.isMacOS || Platform.isIOS) {
+      try {
+        await _channel.invokeMethod('stopSpeechRecognition');
+      } catch (_) {}
+    }
+    if (Platform.isLinux) {
+      await _linuxAsrRunner?.stop();
+    }
+    final proc = _winSpeechProc;
+    if (proc != null) {
+      _winSpeechStopping = true;
+      _winSpeechProc = null;
+      try {
+        proc.kill();
+      } catch (_) {}
+    }
+  }
+
+  @override
+  Future<LocalAsrStatus> queryLocalAsrStatus({
+    String? customModelPath,
+    String? customRuntimePath,
+  }) async {
+    if (!Platform.isLinux) {
+      return const LocalAsrStatus.unsupported();
+    }
+    return queryLinuxLocalAsrStatus(
+      customModelPath: customModelPath,
+      customRuntimePath: customRuntimePath,
+    );
+  }
+
+  @override
+  Stream<LocalAsrDownloadProgress> installLinuxAsrPreset(
+    LocalAsrModelPreset preset, {
+    bool useMirror = false,
+  }) {
+    if (!Platform.isLinux) {
+      return const Stream<LocalAsrDownloadProgress>.empty();
+    }
+    return downloadAndInstallLinuxAsrPreset(
+      preset,
+      useMirror: useMirror,
+    );
+  }
+
+  @override
+  Future<String?> pickLocalAsrPath({required bool directory}) async {
+    if (!Platform.isLinux) return null;
+    return pickLinuxPathDialog(directory: directory);
+  }
+
+  @override
   Future<void> dispose() async {
+    await stopSpeechRecognition();
     await stopNearbyDiscovery();
     await updateHostBroadcastBeacon(null);
     await stopLocalHotspot();
@@ -1052,6 +1291,9 @@ try {
     await stopEmbeddedServer();
     if (!_nearbyController.isClosed) {
       await _nearbyController.close();
+    }
+    if (!_speechController.isClosed) {
+      await _speechController.close();
     }
   }
 }

@@ -507,4 +507,62 @@ void main() {
       expect(doc.getElement('ai_ed')!.sourceId, 'ai_root');
     });
   });
+
+  group('VoiceMemo consolidation & formatting', () {
+    test('deduplicates rolling partials, strips fillers, adds punctuation, extracts todos & styles', () {
+      final draft = consolidateVoiceTranscriptToMemo(
+        const <VoiceTranscriptSegment>[
+          VoiceTranscriptSegment(offsetMs: 800, text: '嗯 今天我们'),
+          VoiceTranscriptSegment(offsetMs: 1900, text: '嗯 今天我们推导矩阵的特征值性质'),
+          VoiceTranscriptSegment(offsetMs: 3200, text: '呃 为什么实对称矩阵一定可以对角化呢'),
+          VoiceTranscriptSegment(offsetMs: 8800, text: '那个 那个 下一步记得完成第三章课后习题'),
+        ],
+        pendingPartial: '注意正交特征向量组',
+        durationMs: 12000,
+        style: MemoFormatStyle.structuredMarkdown,
+        removeFillers: true,
+        includeTimestamps: true,
+      );
+
+      expect(draft.segmentCount, 4);
+      expect(draft.durationMs, 12000);
+      expect(draft.title, isNotEmpty);
+      expect(draft.plainText, isNot(contains('嗯')));
+      expect(draft.plainText, isNot(contains('呃')));
+      expect(draft.completeMarkdown, contains('推导矩阵的特征值性质。'));
+      expect(draft.completeMarkdown, contains('为什么实对称矩阵一定可以对角化呢？'));
+      expect(draft.completeMarkdown, contains('注意正交特征向量组。'));
+      expect(draft.completeMarkdown, contains('[00:00]'));
+      expect(draft.actionItems, contains('完成第三章课后习题'));
+      expect(draft.completeMarkdown, contains('- [ ] 完成第三章课后习题'));
+
+      final cleanProse = consolidateVoiceTranscriptToMemo(
+        const <VoiceTranscriptSegment>[
+          VoiceTranscriptSegment(offsetMs: 500, text: '先核对实验参数'),
+          VoiceTranscriptSegment(offsetMs: 1400, text: '再保存结果'),
+        ],
+        style: MemoFormatStyle.cleanParagraphs,
+        includeTimestamps: false,
+      );
+      expect(cleanProse.completeMarkdown, isNot(startsWith('>')));
+      expect(cleanProse.completeMarkdown, contains('先核对实验参数，再保存结果。'));
+
+      final bullets = consolidateVoiceTranscriptToMemo(
+        const <VoiceTranscriptSegment>[
+          VoiceTranscriptSegment(offsetMs: 1000, text: '整理核心公式推导'),
+          VoiceTranscriptSegment(offsetMs: 3500, text: '待办：核对课后题答案'),
+        ],
+        style: MemoFormatStyle.bulletOutline,
+      );
+      expect(bullets.completeMarkdown, contains('- 整理核心公式推导。'));
+      expect(bullets.completeMarkdown, contains('- [ ] 核对课后题答案'));
+
+      final prompt = buildVoiceMemoAiPolishPrompt(
+        draft.plainText,
+        currentDraft: draft.completeMarkdown,
+      );
+      expect(prompt, contains('原始语音转写'));
+      expect(prompt, contains('- [ ]'));
+    });
+  });
 }

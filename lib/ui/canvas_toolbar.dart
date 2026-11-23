@@ -597,6 +597,7 @@ class DraggableCanvasToolbar extends StatefulWidget {
     required this.onInsertImage,
     this.onImportPdf,
     this.onOpenMindFlowAi,
+    this.onToggleVoiceMemo,
   });
 
   final NotebookController controller;
@@ -605,6 +606,7 @@ class DraggableCanvasToolbar extends StatefulWidget {
   final VoidCallback onInsertImage;
   final VoidCallback? onImportPdf;
   final VoidCallback? onOpenMindFlowAi;
+  final VoidCallback? onToggleVoiceMemo;
 
   @override
   State<DraggableCanvasToolbar> createState() => _DraggableCanvasToolbarState();
@@ -807,6 +809,7 @@ class _DraggableCanvasToolbarState extends State<DraggableCanvasToolbar> {
                       onInsertImage: widget.onInsertImage,
                       onImportPdf: widget.onImportPdf,
                       onOpenMindFlowAi: widget.onOpenMindFlowAi,
+                      onToggleVoiceMemo: widget.onToggleVoiceMemo,
                       onDragStart: _onDragStart,
                       onDragUpdate: _onDragUpdate,
                       onDragEnd: _onDragEnd,
@@ -994,6 +997,7 @@ class CanvasToolbar extends StatelessWidget {
     required this.onInsertImage,
     this.onImportPdf,
     this.onOpenMindFlowAi,
+    this.onToggleVoiceMemo,
     this.direction = Axis.horizontal,
     this.maxMainAxisExtent,
     this.onDragStart,
@@ -1009,6 +1013,7 @@ class CanvasToolbar extends StatelessWidget {
   final VoidCallback onInsertImage;
   final VoidCallback? onImportPdf;
   final VoidCallback? onOpenMindFlowAi;
+  final VoidCallback? onToggleVoiceMemo;
   final Axis direction;
   final double? maxMainAxisExtent;
   final GestureDragStartCallback? onDragStart;
@@ -1214,6 +1219,16 @@ class CanvasToolbar extends StatelessWidget {
                           selected: false,
                           compactPadding: compact,
                           onTap: onOpenMindFlowAi,
+                        ),
+                      if (onToggleVoiceMemo != null)
+                        _ToolBtn(
+                          icon: c.voiceMemoPhase == VoiceMemoPhase.recording
+                              ? Icons.graphic_eq_rounded
+                              : Icons.mic_none_rounded,
+                          tooltip: '语音备忘实时转写 (U)',
+                          selected: c.voiceMemoOpen,
+                          compactPadding: compact,
+                          onTap: onToggleVoiceMemo,
                         ),
                       _ToolBtn(
                         icon: Icons.flare_rounded,
@@ -1426,6 +1441,15 @@ class CanvasToolbar extends StatelessWidget {
                           tooltip: 'MindFlow AI 协同与 MCP',
                           selected: false,
                           onTap: onOpenMindFlowAi,
+                        ),
+                      if (onToggleVoiceMemo != null)
+                        _ToolBtn(
+                          icon: c.voiceMemoPhase == VoiceMemoPhase.recording
+                              ? Icons.graphic_eq_rounded
+                              : Icons.mic_none_rounded,
+                          tooltip: '语音备忘实时转写 (U)',
+                          selected: c.voiceMemoOpen,
+                          onTap: onToggleVoiceMemo,
                         ),
                       _ToolBtn(
                         icon: Icons.flare_rounded,

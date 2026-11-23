@@ -1,7 +1,9 @@
+import AVFoundation
 import Cocoa
 import CoreBluetooth
 import FlutterMacOS
 import PDFKit
+import Speech
 import UniformTypeIdentifiers
 
 class MainFlutterWindow: NSWindow {
@@ -44,6 +46,14 @@ private final class SyncCanvasMacBleBridge: NSObject, CBCentralManagerDelegate, 
   private var peripheralRssi: [UUID: Int] = [:]
   private var lastReadAt: [UUID: Date] = [:]
 
+  private var audioEngine: AVAudioEngine?
+  private var speechRecognizer: Any?
+  private var recognitionRequest: Any?
+  private var recognitionTask: Any?
+  private var wantsSpeechListening = false
+  private var lastSpeechEmitAt = Date.distantPast
+  private var activeSpeechLocale = "zh-CN"
+
   init(channel: FlutterMethodChannel) {
     self.channel = channel
     super.init()
@@ -84,6 +94,13 @@ private final class SyncCanvasMacBleBridge: NSObject, CBCentralManagerDelegate, 
       pickPdf(maxPages: maxPages, result: result)
     case "scanQrCode":
       result(nil)
+    case "startSpeechRecognition":
+      let args = call.arguments as? [String: Any]
+      let locale = args?["locale"] as? String ?? "zh-CN"
+      startSpeechRecognition(localeId: locale, result: result)
+    case "stopSpeechRecognition":
+      stopSpeechRecognition()
+      result(true)
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -515,5 +532,187 @@ private final class SyncCanvasMacBleBridge: NSObject, CBCentralManagerDelegate, 
       )
     }
     centralManager?.cancelPeripheralConnection(peripheral)
+  }
+
+  // MARK: - Live Speech-to-Text Bridge
+
+  private func emitSpeechEvent(_ payload: [String: Any]) {
+    DispatchQueue.main.async { [weak self] in
+      self?.channel.invokeMethod("onSpeechEvent", arguments: payload)
+    }
+  }
+
+  private func startSpeechRecognition(localeId: String, result: @escaping FlutterResult) {
+    guard #available(macOS 10.15, *) else {
+      result([
+        "ok": false,
+        "manualRequired": true,
+        "error": "需要 macOS 10.15 或更高版本才支持系统语音听写引擎",
+      ])
+      return
+    }
+    activeSpeechLocale = localeId
+    wantsSpeechListening = true
+
+    SFSpeechRecognizer.requestAuthorization { [weak self] authStatus in
+      DispatchQueue.main.async {
+        guard let self = self, self.wantsSpeechListening else { return }
+        switch authStatus {
+        case .authorized:
+          AVCaptureDevice.requestAccess(for: .audio) { granted in
+            DispatchQueue.main.async {
+              if granted {
+                self.beginAppleSpeechSession(localeId: localeId, result: result)
+              } else {
+                self.wantsSpeechListening = false
+                result([
+                  "ok": false,
+                  "manualRequired": true,
+                  "error": "请在「系统设置 → 隐私与安全性 → 麦克风」允许本应用访问麦克风",
+                ])
+              }
+            }
+          }
+        case .denied, .restricted:
+          self.wantsSpeechListening = false
+          result([
+            "ok": false,
+            "manualRequired": true,
+            "error": "请在「系统设置 → 隐私与安全性 → 语音识别」授权后使用",
+          ])
+        default:
+          self.wantsSpeechListening = false
+          result([
+            "ok": false,
+            "manualRequired": true,
+            "error": "语音识别权限尚未就绪",
+          ])
+        }
+      }
+    }
+  }
+
+  @available(macOS 10.15, *)
+  private func beginAppleSpeechSession(localeId: String, result: @escaping FlutterResult) {
+    stopSpeechRecognition(keepWantedFlag: true)
+    let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeId))
+      ?? SFSpeechRecognizer()
+    guard let rec = recognizer, rec.isAvailable else {
+      wantsSpeechListening = false
+      result([
+        "ok": false,
+        "manualRequired": true,
+        "error": "当前系统语音识别服务暂不可用，可使用系统听写快捷键或下方速记框录入",
+      ])
+      return
+    }
+
+    let engine = AVAudioEngine()
+    let request = SFSpeechAudioBufferRecognitionRequest()
+    request.shouldReportPartialResults = true
+
+    let inputNode = engine.inputNode
+    let format = inputNode.outputFormat(forBus: 0)
+    guard format.channelCount > 0 && format.sampleRate > 0 else {
+      wantsSpeechListening = false
+      result([
+        "ok": false,
+        "manualRequired": true,
+        "error": "未检测到可用麦克风音频输入设备",
+      ])
+      return
+    }
+
+    inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self, weak request] buffer, _ in
+      request?.append(buffer)
+      guard let self = self else { return }
+      let now = Date()
+      if now.timeIntervalSince(self.lastSpeechEmitAt) >= 0.09,
+         let channelData = buffer.floatChannelData?[0] {
+        self.lastSpeechEmitAt = now
+        let count = Int(buffer.frameLength)
+        if count > 0 {
+          var sum: Float = 0
+          for idx in 0..<count {
+            let v = channelData[idx]
+            sum += v * v
+          }
+          let rms = sqrt(sum / Float(count))
+          let level = min(1.0, max(0.0, Double(rms * 8.0)))
+          self.emitSpeechEvent(["type": "level", "level": level])
+        }
+      }
+    }
+
+    do {
+      engine.prepare()
+      try engine.start()
+    } catch {
+      inputNode.removeTap(onBus: 0)
+      wantsSpeechListening = false
+      result([
+        "ok": false,
+        "manualRequired": true,
+        "error": "无法开启麦克风引擎: \(error.localizedDescription)",
+      ])
+      return
+    }
+
+    speechRecognizer = rec
+    audioEngine = engine
+    recognitionRequest = request
+    emitSpeechEvent(["type": "status", "status": "listening"])
+
+    var latestSent = ""
+    let task = rec.recognitionTask(with: request) { [weak self] speechResult, error in
+      guard let self = self else { return }
+      if let res = speechResult {
+        let text = res.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty {
+          latestSent = text
+          if res.isFinal {
+            self.emitSpeechEvent(["type": "finalized", "text": text])
+            latestSent = ""
+          } else {
+            self.emitSpeechEvent(["type": "partial", "text": text])
+          }
+        }
+      }
+      if error != nil || (speechResult?.isFinal ?? false) {
+        if !latestSent.isEmpty {
+          self.emitSpeechEvent(["type": "finalized", "text": latestSent])
+          latestSent = ""
+        }
+        if !self.wantsSpeechListening {
+          self.emitSpeechEvent(["type": "status", "status": "stopped"])
+        }
+      }
+    }
+    recognitionTask = task
+    result(["ok": true])
+  }
+
+  private func stopSpeechRecognition(keepWantedFlag: Bool = false) {
+    if !keepWantedFlag {
+      wantsSpeechListening = false
+    }
+    if #available(macOS 10.15, *) {
+      if let req = recognitionRequest as? SFSpeechAudioBufferRecognitionRequest {
+        req.endAudio()
+      }
+      if let task = recognitionTask as? SFSpeechRecognitionTask {
+        task.cancel()
+      }
+    }
+    if let engine = audioEngine {
+      if engine.isRunning {
+        engine.stop()
+      }
+      engine.inputNode.removeTap(onBus: 0)
+    }
+    audioEngine = nil
+    recognitionRequest = nil
+    recognitionTask = nil
+    speechRecognizer = nil
   }
 }

@@ -39,5 +39,9 @@
 	<string>用于通过低功耗蓝牙近场发现附近的共享画板并交换热点连接信息</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
 	<string>用于广播本机共享画板房间信息以便附近设备自动发现</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>用于采集语音备忘并实时转为文字记录到共享画板</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>用于在设备本地将语音实时识别并整理为完整文字备忘</string>
 </dict>
 </plist>

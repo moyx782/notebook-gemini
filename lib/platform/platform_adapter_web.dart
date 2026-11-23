@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:js_interop';
 import 'dart:typed_data';
 
@@ -9,10 +10,17 @@ export 'platform_adapter_stub.dart'
     show
         HotspotStartOutcome,
         HttpResponseData,
+        LocalAsrDownloadProgress,
+        LocalAsrEngineKind,
+        LocalAsrModelPreset,
+        LocalAsrStatus,
         OperationOutcome,
         PdfImportedDocument,
         PdfRenderedPage,
-        PlatformAdapter;
+        PlatformAdapter,
+        VoiceSpeechEvent,
+        VoiceSpeechEventType,
+        kLinuxAsrModelPresets;
 
 @JS('window.localStorage')
 external _DomStorage? get _localStorage;
@@ -22,6 +30,15 @@ external JSPromise<_FetchResponse> _jsFetch(String url, [JSAny? init]);
 
 @JS('window.syncCanvasPickPdf')
 external JSPromise<JSString?> _jsPickPdf(int maxPages);
+
+@JS('window.syncCanvasCanSpeech')
+external JSAny? _jsCanSpeech();
+
+@JS('window.syncCanvasStartSpeech')
+external JSString? _jsStartSpeech(String locale, JSFunction onEvent);
+
+@JS('window.syncCanvasStopSpeech')
+external void _jsStopSpeech();
 
 @JS('document.createElement')
 external _DomElement _createElement(String tagName);
@@ -83,6 +100,9 @@ extension type _JsFileReader._(JSObject _) implements JSObject {
 }
 
 class WebPlatformAdapter implements PlatformAdapter {
+  final StreamController<VoiceSpeechEvent> _speechController =
+      StreamController<VoiceSpeechEvent>.broadcast();
+
   @override
   bool get isWeb => true;
 
@@ -105,8 +125,22 @@ class WebPlatformAdapter implements PlatformAdapter {
   bool get canManageHotspot => false;
 
   @override
+  bool get canTranscribeSpeech {
+    try {
+      final res = _jsCanSpeech();
+      if (res != null && res.isA<JSBoolean>()) {
+        return (res as JSBoolean).toDart;
+      }
+    } catch (_) {}
+    return true;
+  }
+
+  @override
   Stream<NearbyBoardBeacon> get nearbyBeacons =>
       const Stream<NearbyBoardBeacon>.empty();
+
+  @override
+  Stream<VoiceSpeechEvent> get speechEvents => _speechController.stream;
 
   @override
   String defaultWsUrl() {
@@ -173,14 +207,24 @@ class WebPlatformAdapter implements PlatformAdapter {
   }
 
   @override
-  Future<HttpResponseData?> httpPostJson(Uri uri, String jsonBody) async {
+  Future<HttpResponseData?> httpPostJson(
+    Uri uri,
+    String jsonBody, {
+    Map<String, String>? headers,
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
     try {
+      final mergedHeaders = <String, String>{
+        'Content-Type': 'application/json',
+        ...?headers,
+      };
       final init = <String, Object?>{
         'method': 'POST',
-        'headers': <String, String>{'Content-Type': 'application/json'},
+        'headers': mergedHeaders,
         'body': jsonBody,
       }.jsify();
-      final response = await _jsFetch(uri.toString(), init).toDart;
+      final response =
+          await _jsFetch(uri.toString(), init).toDart.timeout(timeout);
       final text = (await response.text().toDart).toDart;
       return HttpResponseData(statusCode: response.status, body: text);
     } catch (_) {
@@ -350,7 +394,78 @@ class WebPlatformAdapter implements PlatformAdapter {
   Future<void> openSystemHotspotSettings() async {}
 
   @override
-  Future<void> dispose() async {}
+  Future<OperationOutcome> startSpeechRecognition({
+    String localeId = 'zh-CN',
+    String? localModelPath,
+    String? localRuntimePath,
+  }) async {
+    try {
+      final cb = ((JSString rawJson) {
+        if (_speechController.isClosed) return;
+        try {
+          final parsed = jsonDecode(rawJson.toDart);
+          if (parsed is Map) {
+            _speechController.add(
+              VoiceSpeechEvent.fromJson(Map<String, dynamic>.from(parsed)),
+            );
+          }
+        } catch (_) {}
+      }).toJS;
+      final rawOutcome = _jsStartSpeech(localeId, cb);
+      if (rawOutcome != null && rawOutcome.toDart.isNotEmpty) {
+        final decoded = jsonDecode(rawOutcome.toDart);
+        if (decoded is Map) {
+          return OperationOutcome(
+            ok: decoded['ok'] as bool? ?? false,
+            error: decoded['error'] as String?,
+            manualRequired: decoded['manualRequired'] as bool? ?? false,
+          );
+        }
+      }
+      return const OperationOutcome(ok: true);
+    } catch (e) {
+      return OperationOutcome(
+        ok: false,
+        manualRequired: true,
+        error: '浏览器语音转写不可用: $e',
+      );
+    }
+  }
+
+  @override
+  Future<void> stopSpeechRecognition() async {
+    try {
+      _jsStopSpeech();
+    } catch (_) {}
+  }
+
+  @override
+  bool get supportsLocalAsrModels => false;
+
+  @override
+  Future<LocalAsrStatus> queryLocalAsrStatus({
+    String? customModelPath,
+    String? customRuntimePath,
+  }) async =>
+      const LocalAsrStatus.unsupported();
+
+  @override
+  Stream<LocalAsrDownloadProgress> installLinuxAsrPreset(
+    LocalAsrModelPreset preset, {
+    bool useMirror = false,
+  }) =>
+      const Stream<LocalAsrDownloadProgress>.empty();
+
+  @override
+  Future<String?> pickLocalAsrPath({required bool directory}) async => null;
+
+  @override
+  Future<void> dispose() async {
+    await stopSpeechRecognition();
+    if (!_speechController.isClosed) {
+      await _speechController.close();
+    }
+  }
 }
 
 PlatformAdapter createPlatformAdapter() => WebPlatformAdapter();

@@ -91,6 +91,22 @@ enum SyncConnectionState {
   final String label;
 }
 
+enum VoiceMemoPhase {
+  idle,
+  recording,
+  paused,
+  review,
+}
+
+enum VoiceMemoInsertTarget {
+  markdownCard('Markdown 备忘卡片'),
+  stickyNote('便签贴纸'),
+  mindFlowTokens('MindFlow 概念词块');
+
+  const VoiceMemoInsertTarget(this.label);
+  final String label;
+}
+
 class LaserTrailState {
   LaserTrailState({
     required this.peerId,
@@ -392,6 +408,37 @@ class NotebookController extends ChangeNotifier {
   bool _mindflowMcpReadOnly = true;
   int _localMindFlowRevision = 1;
 
+  // Real-time Voice Memo -> Complete Polished Text Memo state
+  bool _voiceMemoOpen = false;
+  bool _voiceMemoMinimized = false;
+  Offset _voiceMemoOffset = const Offset(20, 68);
+  VoiceMemoPhase _voiceMemoPhase = VoiceMemoPhase.idle;
+  String _voiceLocaleId = 'zh-CN';
+  final List<VoiceTranscriptSegment> _voiceSegments =
+      <VoiceTranscriptSegment>[];
+  String _voicePartialText = '';
+  double _voiceAudioLevel = 0.0;
+  String? _voiceError;
+  int _voiceAccumulatedMs = 0;
+  DateTime? _voiceSegmentStartedAt;
+  DateTime? _voiceRecordedAt;
+  String _voiceMemoDraftTitle = '语音备忘录';
+  String _voiceMemoDraftBody = '';
+  MemoFormatStyle _voiceMemoFormatStyle = MemoFormatStyle.structuredMarkdown;
+  bool _voiceMemoRemoveFillers = true;
+  bool _voiceMemoIncludeTimestamps = false;
+  bool _isPolishingVoiceMemo = false;
+  StreamSubscription<VoiceSpeechEvent>? _speechSub;
+  String _aiApiBaseUrl = 'https://api.openai.com/v1';
+  String _aiApiKey = '';
+  String _aiModelName = 'gpt-4o-mini';
+  String _localAsrModelPath = '';
+  String _localAsrRuntimePath = '';
+  bool _localAsrUseMirror = false;
+  LocalAsrStatus _localAsrStatus = const LocalAsrStatus.unsupported();
+  LocalAsrDownloadProgress? _localAsrDownloadProgress;
+  StreamSubscription<LocalAsrDownloadProgress>? _asrDownloadSub;
+
   final Map<String, PeerPresence> _remotePeers = <String, PeerPresence>{};
   final Map<String, LiveStrokeFrame> _remoteLiveStrokes =
       <String, LiveStrokeFrame>{};
@@ -518,6 +565,39 @@ class NotebookController extends ChangeNotifier {
   MindFlowColor get activeMindFlowColor => _activeMindFlowColor;
   bool get mindflowMcpReadOnly => _mindflowMcpReadOnly;
   int get mindflowRevision => _localMindFlowRevision;
+  bool get voiceMemoOpen => _voiceMemoOpen;
+  bool get voiceMemoMinimized => _voiceMemoMinimized;
+  Offset get voiceMemoOffset => _voiceMemoOffset;
+  VoiceMemoPhase get voiceMemoPhase => _voiceMemoPhase;
+  String get voiceLocaleId => _voiceLocaleId;
+  List<VoiceTranscriptSegment> get voiceSegments =>
+      List<VoiceTranscriptSegment>.unmodifiable(_voiceSegments);
+  String get voicePartialText => _voicePartialText;
+  double get voiceAudioLevel => _voiceAudioLevel;
+  String? get voiceError => _voiceError;
+  int get voiceElapsedMs {
+    final started = _voiceSegmentStartedAt;
+    if (started == null) return _voiceAccumulatedMs;
+    final delta = DateTime.now().difference(started).inMilliseconds;
+    return _voiceAccumulatedMs + math.max(0, delta);
+  }
+  String get voiceMemoDraftTitle => _voiceMemoDraftTitle;
+  String get voiceMemoDraftBody => _voiceMemoDraftBody;
+  MemoFormatStyle get voiceMemoFormatStyle => _voiceMemoFormatStyle;
+  bool get voiceMemoRemoveFillers => _voiceMemoRemoveFillers;
+  bool get voiceMemoIncludeTimestamps => _voiceMemoIncludeTimestamps;
+  bool get isPolishingVoiceMemo => _isPolishingVoiceMemo;
+  String get aiApiBaseUrl => _aiApiBaseUrl;
+  String get aiApiKey => _aiApiKey;
+  String get aiModelName => _aiModelName;
+  String get localAsrModelPath => _localAsrModelPath;
+  String get localAsrRuntimePath => _localAsrRuntimePath;
+  bool get localAsrUseMirror => _localAsrUseMirror;
+  LocalAsrStatus get localAsrStatus => _localAsrStatus;
+  LocalAsrDownloadProgress? get localAsrDownloadProgress =>
+      _localAsrDownloadProgress;
+  bool get hasVoiceTranscriptContent =>
+      _voiceSegments.isNotEmpty || _voicePartialText.trim().isNotEmpty;
   Listenable get livePaintListenable => _livePaintNotifier;
   int get committedInkRevision => _committedInkRevision;
   Map<String, PeerPresence> get remotePeersMap => _remotePeers;
@@ -4155,6 +4235,784 @@ class NotebookController extends ChangeNotifier {
   }
 
   // ---------------------------------------------------------------------------
+  // Real-Time Voice Memo -> Complete Polished Text Memo
+  // ---------------------------------------------------------------------------
+
+  void _ensureSpeechSubscription() {
+    if (_speechSub != null) return;
+    _speechSub = _platform.speechEvents.listen(_onSpeechEvent);
+  }
+
+  void _onSpeechEvent(VoiceSpeechEvent event) {
+    if (_disposed) return;
+    switch (event.type) {
+      case VoiceSpeechEventType.partial:
+        if (_voiceMemoPhase != VoiceMemoPhase.recording &&
+            _voiceMemoPhase != VoiceMemoPhase.paused) {
+          return;
+        }
+        final next = event.text.trim();
+        if (next != _voicePartialText) {
+          _voicePartialText = next;
+          notifyListeners();
+        }
+        break;
+      case VoiceSpeechEventType.finalized:
+        if (_voiceMemoPhase == VoiceMemoPhase.review) {
+          return;
+        }
+        final cleaned = event.text.trim();
+        if (cleaned.isNotEmpty) {
+          _appendVoiceSegmentDedup(
+            VoiceTranscriptSegment(offsetMs: voiceElapsedMs, text: cleaned),
+          );
+        }
+        _voicePartialText = '';
+        notifyListeners();
+        break;
+      case VoiceSpeechEventType.level:
+        if (_voiceMemoPhase != VoiceMemoPhase.recording) return;
+        final nextLevel = event.level.clamp(0.0, 1.0);
+        if ((nextLevel - _voiceAudioLevel).abs() >= 0.03) {
+          _voiceAudioLevel = nextLevel;
+          notifyListeners();
+        }
+        break;
+      case VoiceSpeechEventType.status:
+        if (event.status == 'stopped' &&
+            _voiceMemoPhase == VoiceMemoPhase.recording) {
+          _freezeVoiceClock();
+          _voiceMemoPhase = VoiceMemoPhase.paused;
+          _voiceAudioLevel = 0.0;
+          notifyListeners();
+        }
+        break;
+      case VoiceSpeechEventType.error:
+        final err = (event.error ?? '').trim();
+        if (err.isNotEmpty) {
+          _voiceError = err;
+          if (_voiceMemoPhase == VoiceMemoPhase.recording) {
+            _freezeVoiceClock();
+            _voiceMemoPhase = VoiceMemoPhase.paused;
+            _voiceAudioLevel = 0.0;
+          }
+          notifyListeners();
+        }
+        break;
+    }
+  }
+
+  void _appendVoiceSegmentDedup(VoiceTranscriptSegment seg) {
+    final text = seg.text.trim();
+    if (text.isEmpty) return;
+    if (_voiceSegments.isNotEmpty) {
+      final prev = _voiceSegments.last;
+      final delta = (seg.offsetMs - prev.offsetMs).abs();
+      if (delta <= 3000) {
+        if (text == prev.text) return;
+        if (text.startsWith(prev.text)) {
+          _voiceSegments[_voiceSegments.length - 1] = VoiceTranscriptSegment(
+            offsetMs: prev.offsetMs,
+            text: text,
+          );
+          return;
+        }
+      }
+    }
+    _voiceSegments.add(
+      VoiceTranscriptSegment(offsetMs: seg.offsetMs, text: text),
+    );
+  }
+
+  void _freezeVoiceClock() {
+    final started = _voiceSegmentStartedAt;
+    if (started != null) {
+      final delta = DateTime.now().difference(started).inMilliseconds;
+      _voiceAccumulatedMs += math.max(0, delta);
+      _voiceSegmentStartedAt = null;
+    }
+  }
+
+  void openVoiceMemo() {
+    _ensureSpeechSubscription();
+    if (_platform.supportsLocalAsrModels) {
+      unawaited(refreshLocalAsrStatus());
+    }
+    if (!_voiceMemoOpen) {
+      _voiceMemoOpen = true;
+      _voiceMemoMinimized = false;
+      notifyListeners();
+    } else if (_voiceMemoMinimized) {
+      _voiceMemoMinimized = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> refreshLocalAsrStatus() async {
+    if (!_platform.supportsLocalAsrModels || _disposed) return;
+    final status = await _platform.queryLocalAsrStatus(
+      customModelPath: _localAsrModelPath,
+      customRuntimePath: _localAsrRuntimePath,
+    );
+    if (_disposed) return;
+    _localAsrStatus = status;
+    notifyListeners();
+  }
+
+  void setLocalAsrUseMirror(bool value) {
+    if (_localAsrUseMirror == value) return;
+    _localAsrUseMirror = value;
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  Future<void> configureLocalAsrPaths({
+    required String modelPath,
+    required String runtimePath,
+  }) async {
+    _localAsrModelPath = modelPath.trim();
+    _localAsrRuntimePath = runtimePath.trim();
+    _voiceError = null;
+    _scheduleSave();
+    await refreshLocalAsrStatus();
+  }
+
+  Future<String?> browseAndSelectLocalAsrPath({required bool directory}) {
+    return _platform.pickLocalAsrPath(directory: directory);
+  }
+
+  Future<void> installLinuxLocalAsrPreset(LocalAsrModelPreset preset) async {
+    if (!_platform.supportsLocalAsrModels || _disposed) return;
+    await _asrDownloadSub?.cancel();
+    _voiceError = null;
+    _localAsrDownloadProgress = LocalAsrDownloadProgress(
+      stage: '准备下载 ${preset.name}...',
+      fraction: 0.01,
+    );
+    notifyListeners();
+
+    final completer = Completer<void>();
+    _asrDownloadSub = _platform
+        .installLinuxAsrPreset(preset, useMirror: _localAsrUseMirror)
+        .listen(
+      (progress) {
+        if (_disposed) return;
+        _localAsrDownloadProgress = progress;
+        if (progress.done) {
+          if (progress.error != null) {
+            _voiceError = progress.error;
+          } else {
+            if (progress.installedModelPath != null &&
+                progress.installedModelPath!.isNotEmpty) {
+              _localAsrModelPath = progress.installedModelPath!;
+            }
+            if (progress.installedRuntimePath != null &&
+                progress.installedRuntimePath!.isNotEmpty &&
+                _localAsrRuntimePath.isEmpty) {
+              _localAsrRuntimePath = '';
+            }
+            _scheduleSave();
+            unawaited(refreshLocalAsrStatus());
+          }
+          if (!completer.isCompleted) completer.complete();
+        }
+        notifyListeners();
+      },
+      onError: (Object err) {
+        if (_disposed) return;
+        _localAsrDownloadProgress = LocalAsrDownloadProgress(
+          stage: '下载异常',
+          fraction: 0.0,
+          done: true,
+          error: '$err',
+        );
+        _voiceError = '端侧模型下载失败: $err';
+        notifyListeners();
+        if (!completer.isCompleted) completer.complete();
+      },
+      onDone: () {
+        if (!completer.isCompleted) completer.complete();
+      },
+    );
+
+    await completer.future;
+  }
+
+  Future<void> closeVoiceMemo() async {
+    if (_voiceMemoPhase == VoiceMemoPhase.recording) {
+      await pauseVoiceMemoRecording();
+    }
+    if (_voiceMemoOpen) {
+      _voiceMemoOpen = false;
+      notifyListeners();
+    }
+  }
+
+  void toggleVoiceMemo() {
+    if (_voiceMemoOpen) {
+      unawaited(closeVoiceMemo());
+    } else {
+      openVoiceMemo();
+    }
+  }
+
+  void setVoiceMemoMinimized(bool minimized) {
+    if (_voiceMemoMinimized == minimized) return;
+    _voiceMemoMinimized = minimized;
+    notifyListeners();
+  }
+
+  void updateVoiceMemoOffset(Offset nextOffset) {
+    if (nextOffset == _voiceMemoOffset) return;
+    _voiceMemoOffset = nextOffset;
+    notifyListeners();
+  }
+
+  void setVoiceLocaleId(String localeId) {
+    if (_voiceLocaleId == localeId) return;
+    _voiceLocaleId = localeId;
+    if (_voiceMemoPhase == VoiceMemoPhase.recording) {
+      unawaited(
+        startVoiceMemoRecording(localeId: localeId, resetExisting: false),
+      );
+      return;
+    }
+    notifyListeners();
+  }
+
+  Future<bool> startVoiceMemoRecording({
+    String? localeId,
+    bool resetExisting = false,
+  }) async {
+    _ensureSpeechSubscription();
+    if (localeId != null && localeId.isNotEmpty) {
+      _voiceLocaleId = localeId;
+    }
+    if (resetExisting) {
+      _voiceSegments.clear();
+      _voicePartialText = '';
+      _voiceAccumulatedMs = 0;
+      _voiceMemoDraftTitle = '语音备忘录';
+      _voiceMemoDraftBody = '';
+      _voiceRecordedAt = DateTime.now();
+    } else {
+      _voiceRecordedAt ??= DateTime.now();
+    }
+
+    _voiceMemoOpen = true;
+    _voiceError = null;
+    _voiceAudioLevel = 0.0;
+    _voiceSegmentStartedAt = DateTime.now();
+    _voiceMemoPhase = VoiceMemoPhase.recording;
+    notifyListeners();
+
+    final outcome = await _platform.startSpeechRecognition(
+      localeId: _voiceLocaleId,
+      localModelPath: _localAsrModelPath.isNotEmpty ? _localAsrModelPath : null,
+      localRuntimePath:
+          _localAsrRuntimePath.isNotEmpty ? _localAsrRuntimePath : null,
+    );
+    if (_disposed) return false;
+    if (!outcome.ok) {
+      _freezeVoiceClock();
+      _voiceMemoPhase = VoiceMemoPhase.paused;
+      _voiceError = outcome.error ?? '无法开启系统麦克风语音识别';
+      notifyListeners();
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> pauseVoiceMemoRecording() async {
+    if (_voiceMemoPhase == VoiceMemoPhase.recording) {
+      _freezeVoiceClock();
+      if (_voicePartialText.trim().isNotEmpty) {
+        _appendVoiceSegmentDedup(
+          VoiceTranscriptSegment(
+            offsetMs: _voiceAccumulatedMs,
+            text: _voicePartialText.trim(),
+          ),
+        );
+        _voicePartialText = '';
+      }
+      _voiceMemoPhase = VoiceMemoPhase.paused;
+      _voiceAudioLevel = 0.0;
+      notifyListeners();
+    }
+    await _platform.stopSpeechRecognition();
+  }
+
+  Future<bool> resumeVoiceMemoRecording() {
+    return startVoiceMemoRecording(resetExisting: false);
+  }
+
+  void appendManualVoiceNote(String text) {
+    final cleaned = text.trim();
+    if (cleaned.isEmpty) return;
+    _voiceRecordedAt ??= DateTime.now();
+    _voiceError = null;
+    _appendVoiceSegmentDedup(
+      VoiceTranscriptSegment(offsetMs: voiceElapsedMs, text: cleaned),
+    );
+    notifyListeners();
+  }
+
+  void clearVoiceMemoSession() {
+    unawaited(_platform.stopSpeechRecognition());
+    _voiceSegments.clear();
+    _voicePartialText = '';
+    _voiceAudioLevel = 0.0;
+    _voiceError = null;
+    _voiceAccumulatedMs = 0;
+    _voiceSegmentStartedAt = null;
+    _voiceRecordedAt = null;
+    _voiceMemoDraftTitle = '语音备忘录';
+    _voiceMemoDraftBody = '';
+    _voiceMemoPhase = VoiceMemoPhase.idle;
+    notifyListeners();
+  }
+
+  Future<VoiceMemoDraft> finishVoiceMemoToCompleteText() async {
+    _freezeVoiceClock();
+    if (_voicePartialText.trim().isNotEmpty) {
+      _appendVoiceSegmentDedup(
+        VoiceTranscriptSegment(
+          offsetMs: _voiceAccumulatedMs,
+          text: _voicePartialText.trim(),
+        ),
+      );
+      _voicePartialText = '';
+    }
+    _voiceAudioLevel = 0.0;
+    _voiceMemoPhase = VoiceMemoPhase.review;
+    _voiceMemoMinimized = false;
+
+    final draft = consolidateVoiceTranscriptToMemo(
+      _voiceSegments,
+      durationMs: _voiceAccumulatedMs,
+      recordedAt: _voiceRecordedAt ?? DateTime.now(),
+      style: _voiceMemoFormatStyle,
+      removeFillers: _voiceMemoRemoveFillers,
+      includeTimestamps: _voiceMemoIncludeTimestamps,
+    );
+    _voiceMemoDraftTitle = draft.title;
+    _voiceMemoDraftBody = draft.completeMarkdown;
+    notifyListeners();
+
+    await _platform.stopSpeechRecognition();
+    return draft;
+  }
+
+  void returnToVoiceRecording() {
+    _voiceMemoPhase = VoiceMemoPhase.paused;
+    notifyListeners();
+  }
+
+  void updateVoiceMemoDraftEdits({String? title, String? body}) {
+    var changed = false;
+    if (title != null && title != _voiceMemoDraftTitle) {
+      _voiceMemoDraftTitle = title;
+      changed = true;
+    }
+    if (body != null && body != _voiceMemoDraftBody) {
+      _voiceMemoDraftBody = body;
+      changed = true;
+    }
+    if (changed) {
+      notifyListeners();
+    }
+  }
+
+  void regenerateVoiceMemoDraft({
+    MemoFormatStyle? style,
+    bool? removeFillers,
+    bool? includeTimestamps,
+  }) {
+    if (style != null) _voiceMemoFormatStyle = style;
+    if (removeFillers != null) _voiceMemoRemoveFillers = removeFillers;
+    if (includeTimestamps != null) {
+      _voiceMemoIncludeTimestamps = includeTimestamps;
+    }
+    final draft = consolidateVoiceTranscriptToMemo(
+      _voiceSegments,
+      pendingPartial: _voicePartialText,
+      durationMs: _voiceAccumulatedMs,
+      recordedAt: _voiceRecordedAt ?? DateTime.now(),
+      style: _voiceMemoFormatStyle,
+      removeFillers: _voiceMemoRemoveFillers,
+      includeTimestamps: _voiceMemoIncludeTimestamps,
+    );
+    _voiceMemoDraftTitle = draft.title;
+    _voiceMemoDraftBody = draft.completeMarkdown;
+    notifyListeners();
+  }
+
+  void configureVoiceMemoAi({
+    required String apiBaseUrl,
+    required String apiKey,
+    required String modelName,
+  }) {
+    _aiApiBaseUrl = apiBaseUrl.trim().isEmpty
+        ? 'https://api.openai.com/v1'
+        : apiBaseUrl.trim();
+    _aiApiKey = apiKey.trim();
+    _aiModelName = modelName.trim().isEmpty ? 'gpt-4o-mini' : modelName.trim();
+    _scheduleSave();
+    notifyListeners();
+  }
+
+  Future<OperationOutcome> polishVoiceMemoDraftWithAi() async {
+    final base = _aiApiBaseUrl.trim().replaceFirst(RegExp(r'/+$'), '');
+    final key = _aiApiKey.trim();
+    final model =
+        _aiModelName.trim().isEmpty ? 'gpt-4o-mini' : _aiModelName.trim();
+    final isLocalEndpoint =
+        base.contains('127.0.0.1') || base.contains('localhost');
+    if (key.isEmpty && !isLocalEndpoint) {
+      return const OperationOutcome(
+        ok: false,
+        manualRequired: true,
+        error: '请先在「AI 配置」中填写 API Key（支持 OpenAI 兼容或 Gemini 接口）',
+      );
+    }
+
+    final rawLines = _voiceSegments
+        .map((s) => '[${s.formattedTimestamp}] ${s.text}')
+        .join('\n')
+        .trim();
+    final promptInput = rawLines.isNotEmpty ? rawLines : _voiceMemoDraftBody;
+    if (promptInput.trim().isEmpty) {
+      return const OperationOutcome(
+        ok: false,
+        error: '当前没有可润色的语音转写文本',
+      );
+    }
+
+    _isPolishingVoiceMemo = true;
+    _voiceError = null;
+    notifyListeners();
+
+    try {
+      final promptText = buildVoiceMemoAiPolishPrompt(
+        promptInput,
+        currentDraft: _voiceMemoDraftBody,
+      );
+
+      final isGeminiRest = base.contains('googleapis.com') &&
+          model.toLowerCase().contains('gemini');
+
+      HttpResponseData? resp;
+      if (isGeminiRest) {
+        final uri = Uri.parse(
+          '$base/models/${Uri.encodeComponent(model)}:generateContent?key=${Uri.encodeQueryComponent(key)}',
+        );
+        resp = await _platform.httpPostJson(
+          uri,
+          jsonEncode(<String, dynamic>{
+            'contents': <Map<String, dynamic>>[
+              <String, dynamic>{
+                'parts': <Map<String, dynamic>>[
+                  <String, dynamic>{'text': promptText},
+                ],
+              },
+            ],
+            'generationConfig': <String, dynamic>{'temperature': 0.2},
+          }),
+          timeout: const Duration(seconds: 25),
+        );
+      } else {
+        final endpoint = base.endsWith('/chat/completions')
+            ? base
+            : '$base/chat/completions';
+        final headers = <String, String>{
+          if (key.isNotEmpty) 'Authorization': 'Bearer $key',
+        };
+        resp = await _platform.httpPostJson(
+          Uri.parse(endpoint),
+          jsonEncode(<String, dynamic>{
+            'model': model,
+            'temperature': 0.2,
+            'messages': <Map<String, dynamic>>[
+              <String, dynamic>{
+                'role': 'system',
+                'content':
+                    '你是一个严谨准确的语音笔记整理助手，负责将实时语音转写整理为完整、流畅、不遗漏重点的 Markdown 备忘录。',
+              },
+              <String, dynamic>{'role': 'user', 'content': promptText},
+            ],
+          }),
+          headers: headers,
+          timeout: const Duration(seconds: 25),
+        );
+      }
+
+      if (_disposed) {
+        return const OperationOutcome(ok: false, error: '已关闭');
+      }
+      if (resp == null || resp.statusCode < 200 || resp.statusCode >= 300) {
+        final statusInfo = resp == null ? '网络请求超时或无响应' : 'HTTP ${resp.statusCode}';
+        return OperationOutcome(ok: false, error: 'AI 润色失败（$statusInfo）');
+      }
+
+      final decoded = jsonDecode(resp.body) as Map<String, dynamic>;
+      String? polished;
+      if (isGeminiRest) {
+        final cands = decoded['candidates'] as List<dynamic>?;
+        if (cands != null && cands.isNotEmpty && cands.first is Map) {
+          final content = (cands.first as Map)['content'] as Map?;
+          final parts = content?['parts'] as List<dynamic>?;
+          if (parts != null && parts.isNotEmpty && parts.first is Map) {
+            polished = (parts.first as Map)['text'] as String?;
+          }
+        }
+      } else {
+        final choices = decoded['choices'] as List<dynamic>?;
+        if (choices != null && choices.isNotEmpty && choices.first is Map) {
+          final msg = (choices.first as Map)['message'] as Map?;
+          polished = msg?['content'] as String?;
+        }
+      }
+
+      var cleaned = (polished ?? '').trim();
+      final fenceMatch = RegExp(
+        r'^```(?:markdown|md)?\s*([\s\S]*?)\s*```$',
+        caseSensitive: false,
+      ).firstMatch(cleaned);
+      if (fenceMatch != null) {
+        cleaned = fenceMatch.group(1)!.trim();
+      }
+      if (cleaned.isEmpty) {
+        return const OperationOutcome(ok: false, error: 'AI 未返回有效文本内容');
+      }
+
+      final lines = cleaned.split('\n');
+      if (lines.isNotEmpty && lines.first.trim().startsWith('# ')) {
+        final heading = lines.first.trim().substring(2).trim();
+        if (heading.isNotEmpty) {
+          _voiceMemoDraftTitle = heading;
+        }
+        cleaned = lines.skip(1).join('\n').trim();
+      }
+      _voiceMemoDraftBody = cleaned;
+      return const OperationOutcome(ok: true);
+    } catch (e) {
+      return OperationOutcome(ok: false, error: 'AI 润色请求异常: $e');
+    } finally {
+      _isPolishingVoiceMemo = false;
+      if (!_disposed) {
+        notifyListeners();
+      }
+    }
+  }
+
+  List<String> commitVoiceMemoToCanvas({
+    VoiceMemoInsertTarget target = VoiceMemoInsertTarget.markdownCard,
+  }) {
+    final title = _voiceMemoDraftTitle.trim().isEmpty
+        ? '语音备忘录'
+        : _voiceMemoDraftTitle.trim();
+    final body = _voiceMemoDraftBody.trim();
+    if (body.isEmpty) return const <String>[];
+
+    final hasLockedPdf = activeElements.any(
+      (e) => !e.deleted && e.locked && e.zIndex <= -50,
+    );
+    final viewTopY = ((80.0 - _panOffset.dy) / _zoom).clamp(40.0, 20000.0);
+    final center = _screenCenterInScene();
+    final createdIds = <String>[];
+
+    switch (target) {
+      case VoiceMemoInsertTarget.markdownCard:
+        const cardW = 380.0;
+        final lines = body.split('\n').length;
+        final cardH = (160.0 + lines * 22.0).clamp(220.0, 480.0).toDouble();
+        final x = hasLockedPdf ? 920.0 : center.dx - cardW * 0.5;
+        final y = hasLockedPdf ? viewTopY : center.dy - cardH * 0.5;
+        final cardText = body.startsWith('#') ? body : '## 🎙️ $title\n\n$body';
+        final id = _newEntityId('el');
+        _commitPatch(
+          EntityType.element,
+          id,
+          <String, Object?>{
+            'pageId': _activePageId,
+            'kind': ElementKind.textCard.name,
+            'x': x,
+            'y': y,
+            'width': cardW,
+            'height': cardH,
+            'colorValue': 0xFF0F172A,
+            'fillColorValue': 0xFFFFFFFF,
+            'strokeWidth': 2.0,
+            'text': cardText,
+            'zIndex': _doc.nextZIndex(_activePageId),
+            'authorId': _peerId,
+            'authorName': _displayName,
+            'deleted': false,
+          },
+        );
+        createdIds.add(id);
+        break;
+
+      case VoiceMemoInsertTarget.stickyNote:
+        const noteW = 260.0;
+        const noteH = 240.0;
+        final x = hasLockedPdf ? 920.0 : center.dx - noteW * 0.5;
+        final y = hasLockedPdf ? viewTopY : center.dy - noteH * 0.5;
+        final noteColor = stickyPalette[0].toARGB32();
+        final id = _newEntityId('el');
+        _commitPatch(
+          EntityType.element,
+          id,
+          <String, Object?>{
+            'pageId': _activePageId,
+            'kind': ElementKind.stickyNote.name,
+            'x': x,
+            'y': y,
+            'width': noteW,
+            'height': noteH,
+            'colorValue': noteColor,
+            'fillColorValue': noteColor,
+            'strokeWidth': 2.0,
+            'text': '🎙️ $title\n\n$body',
+            'zIndex': _doc.nextZIndex(_activePageId),
+            'authorId': _peerId,
+            'authorName': _displayName,
+            'deleted': false,
+          },
+        );
+        createdIds.add(id);
+        break;
+
+      case VoiceMemoInsertTarget.mindFlowTokens:
+        final rawPoints = body
+            .split('\n')
+            .map((l) => l.trim())
+            .where((l) => l.isNotEmpty && !l.startsWith('>') && !l.startsWith('#'))
+            .map((l) => l.replaceFirst(RegExp(r'^[-*]\s*(?:\[[xX ]\]\s*)?'), ''))
+            .where((l) => l.isNotEmpty)
+            .take(6)
+            .toList();
+        final startX = hasLockedPdf ? 920.0 : math.max(80.0, center.dx - 220.0);
+        final startY = hasLockedPdf ? viewTopY : math.max(80.0, center.dy - 140.0);
+
+        final ops = <CrdtOp>[];
+        final undoGroup = <UndoPatch>[];
+        final rootId = _newEntityId('el');
+        final rootPair = _doc.mutateEntity(
+          entityType: EntityType.element,
+          entityId: rootId,
+          fields: <String, Object?>{
+            'pageId': _activePageId,
+            'kind': ElementKind.token.name,
+            'x': startX,
+            'y': startY + (rawPoints.length > 1 ? (rawPoints.length - 1) * 34.0 : 0.0),
+            'width': 196.0,
+            'height': 56.0,
+            'colorValue': MindFlowColor.yellow.borderArgb,
+            'fillColorValue': MindFlowColor.yellow.fillArgb,
+            'semanticColor': MindFlowColor.yellow.name,
+            'strokeWidth': 2.0,
+            'text': '🎙️ $title',
+            'zIndex': _doc.nextZIndex(_activePageId),
+            'authorId': _peerId,
+            'authorName': _displayName,
+            'deleted': false,
+          },
+        );
+        ops.add(rootPair.forward);
+        undoGroup.add(rootPair.undoPatch);
+        createdIds.add(rootId);
+
+        for (var idx = 0; idx < rawPoints.length; idx++) {
+          final childId = _newEntityId('el');
+          final edgeId = _newEntityId('el');
+          final childColor = idx.isEven ? MindFlowColor.blue : MindFlowColor.green;
+          final childX = startX + 264.0;
+          final childY = startY + idx * 78.0;
+          final snippet = rawPoints[idx].length > 36
+              ? '${rawPoints[idx].substring(0, 36)}…'
+              : rawPoints[idx];
+          final childPair = _doc.mutateEntity(
+            entityType: EntityType.element,
+            entityId: childId,
+            fields: <String, Object?>{
+              'pageId': _activePageId,
+              'kind': ElementKind.token.name,
+              'x': childX,
+              'y': childY,
+              'width': 220.0,
+              'height': 56.0,
+              'colorValue': childColor.borderArgb,
+              'fillColorValue': childColor.fillArgb,
+              'semanticColor': childColor.name,
+              'strokeWidth': 2.0,
+              'text': snippet,
+              'zIndex': _doc.nextZIndex(_activePageId) + idx + 1,
+              'authorId': _peerId,
+              'authorName': _displayName,
+              'deleted': false,
+            },
+          );
+          final edgePair = _doc.mutateEntity(
+            entityType: EntityType.element,
+            entityId: edgeId,
+            fields: <String, Object?>{
+              'pageId': _activePageId,
+              'kind': ElementKind.connector.name,
+              'sourceId': rootId,
+              'targetId': childId,
+              'x': startX + 196.0,
+              'y': startY + 28.0,
+              'width': 68.0,
+              'height': (childY - startY).abs(),
+              'colorValue': childColor.borderArgb,
+              'fillColorValue': 0,
+              'semanticColor': childColor.name,
+              'strokeWidth': 2.4,
+              'text': '',
+              'zIndex': -5,
+              'authorId': _peerId,
+              'authorName': _displayName,
+              'deleted': false,
+            },
+          );
+          ops.addAll(<CrdtOp>[childPair.forward, edgePair.forward]);
+          undoGroup.addAll(<UndoPatch>[childPair.undoPatch, edgePair.undoPatch]);
+          createdIds.add(childId);
+        }
+
+        _pushUndoGroup(undoGroup);
+        _bumpCommittedInk();
+        _bumpLivePaint();
+        _dispatchOps(ops);
+        break;
+    }
+
+    if (createdIds.isNotEmpty) {
+      _selectedElementIds
+        ..clear()
+        ..addAll(createdIds.length > 1 ? createdIds : const <String>[]);
+      _selectedElementId = createdIds.first;
+      _editingCardId = null;
+      _tool = CanvasTool.select;
+      _maybePushSelectionPresence();
+    }
+
+    unawaited(_platform.stopSpeechRecognition());
+    _voiceSegments.clear();
+    _voicePartialText = '';
+    _voiceAudioLevel = 0.0;
+    _voiceError = null;
+    _voiceAccumulatedMs = 0;
+    _voiceSegmentStartedAt = null;
+    _voiceRecordedAt = null;
+    _voiceMemoPhase = VoiceMemoPhase.idle;
+    _voiceMemoOpen = false;
+    notifyListeners();
+    return createdIds;
+  }
+
+  // ---------------------------------------------------------------------------
   // Internal Sync & Persistence Helpers
   // ---------------------------------------------------------------------------
 
@@ -4687,6 +5545,33 @@ class NotebookController extends ChangeNotifier {
         if (savedMcpRo != null) {
           _mindflowMcpReadOnly = savedMcpRo;
         }
+        final savedAiBase = meta['aiApiBaseUrl'] as String?;
+        if (savedAiBase != null && savedAiBase.trim().isNotEmpty) {
+          _aiApiBaseUrl = savedAiBase.trim();
+        }
+        final savedAiKey = meta['aiApiKey'] as String?;
+        if (savedAiKey != null) {
+          _aiApiKey = savedAiKey;
+        }
+        final savedAiModel = meta['aiModelName'] as String?;
+        if (savedAiModel != null && savedAiModel.trim().isNotEmpty) {
+          _aiModelName = savedAiModel.trim();
+        }
+        final savedAsrModel = meta['localAsrModelPath'] as String?;
+        if (savedAsrModel != null) {
+          _localAsrModelPath = savedAsrModel.trim();
+        }
+        final savedAsrRuntime = meta['localAsrRuntimePath'] as String?;
+        if (savedAsrRuntime != null) {
+          _localAsrRuntimePath = savedAsrRuntime.trim();
+        }
+        final savedAsrMirror = meta['localAsrUseMirror'] as bool?;
+        if (savedAsrMirror != null) {
+          _localAsrUseMirror = savedAsrMirror;
+        }
+        if (_platform.supportsLocalAsrModels) {
+          unawaited(refreshLocalAsrStatus());
+        }
         final savedDock = meta['toolbarDock'] as String?;
         if (savedDock != null && savedDock.isNotEmpty) {
           _toolbarDock = ToolbarDock.values.firstWhere(
@@ -4769,6 +5654,12 @@ class NotebookController extends ChangeNotifier {
         'roomId': _roomId,
         'showPageGuide': _showPageGuide,
         'mindflowMcpReadOnly': _mindflowMcpReadOnly,
+        'aiApiBaseUrl': _aiApiBaseUrl,
+        'aiApiKey': _aiApiKey,
+        'aiModelName': _aiModelName,
+        'localAsrModelPath': _localAsrModelPath,
+        'localAsrRuntimePath': _localAsrRuntimePath,
+        'localAsrUseMirror': _localAsrUseMirror,
         'toolbarDock': _toolbarDock.name,
         'toolbarFloatingVertical': _toolbarFloatingVertical,
         'toolbarCollapsed': _toolbarCollapsed,
@@ -4808,6 +5699,8 @@ class NotebookController extends ChangeNotifier {
     _deferredInboundFlushTimer?.cancel();
     _hostIpRefreshTimer?.cancel();
     _nearbySub?.cancel();
+    _speechSub?.cancel();
+    _asrDownloadSub?.cancel();
     _wsSub?.cancel();
     _livePaintNotifier.dispose();
     try {

@@ -122,6 +122,150 @@
         input.click();
       });
     };
+
+    (function() {
+      var SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+      var activeRec = null;
+      var levelTimer = null;
+      var micStream = null;
+      var audioCtx = null;
+
+      window.syncCanvasCanSpeech = function() {
+        return !!SpeechRec;
+      };
+
+      window.syncCanvasStopSpeech = function() {
+        window._syncCanvasSpeechActive = false;
+        if (levelTimer) {
+          clearInterval(levelTimer);
+          levelTimer = null;
+        }
+        if (micStream) {
+          try {
+            micStream.getTracks().forEach(function(t) { t.stop(); });
+          } catch (_) {}
+          micStream = null;
+        }
+        if (audioCtx) {
+          try { audioCtx.close(); } catch (_) {}
+          audioCtx = null;
+        }
+        if (activeRec) {
+          var rec = activeRec;
+          activeRec = null;
+          try { rec.stop(); } catch (_) {}
+        }
+      };
+
+      window.syncCanvasStartSpeech = function(locale, onEvent) {
+        if (!SpeechRec) {
+          return JSON.stringify({
+            ok: false,
+            manualRequired: true,
+            error: '当前浏览器不支持 Web Speech 实时语音识别，推荐使用 Chrome / Edge 或原生客户端，或直接使用系统语音输入法录入'
+          });
+        }
+        window.syncCanvasStopSpeech();
+        window._syncCanvasSpeechActive = true;
+
+        function emit(obj) {
+          if (typeof onEvent === 'function') {
+            try { onEvent(JSON.stringify(obj)); } catch (_) {}
+          }
+        }
+
+        function startRecognizer() {
+          if (!window._syncCanvasSpeechActive) return;
+          var rec = new SpeechRec();
+          activeRec = rec;
+          rec.continuous = true;
+          rec.interimResults = true;
+          rec.lang = locale || 'zh-CN';
+
+          rec.onstart = function() {
+            emit({ type: 'status', status: 'listening' });
+          };
+          rec.onresult = function(ev) {
+            var interim = '';
+            for (var i = ev.resultIndex; i < ev.results.length; i++) {
+              var res = ev.results[i];
+              var txt = res && res[0] ? String(res[0].transcript || '').trim() : '';
+              if (!txt) continue;
+              if (res.isFinal) {
+                emit({ type: 'finalized', text: txt });
+              } else {
+                interim = interim ? (interim + ' ' + txt) : txt;
+              }
+            }
+            emit({ type: 'partial', text: interim });
+          };
+          rec.onerror = function(ev) {
+            var code = ev && ev.error ? String(ev.error) : 'unknown';
+            if (code === 'no-speech' || code === 'aborted') return;
+            var msg = code === 'not-allowed'
+              ? '请在浏览器地址栏允许麦克风权限'
+              : ('语音识别中断: ' + code);
+            emit({ type: 'error', error: msg });
+            if (code === 'not-allowed' || code === 'service-not-allowed') {
+              window.syncCanvasStopSpeech();
+            }
+          };
+          rec.onend = function() {
+            if (window._syncCanvasSpeechActive) {
+              setTimeout(function() {
+                if (window._syncCanvasSpeechActive) {
+                  try { startRecognizer(); } catch (_) {}
+                }
+              }, 120);
+            } else {
+              emit({ type: 'status', status: 'stopped' });
+            }
+          };
+
+          try {
+            rec.start();
+          } catch (err) {
+            emit({ type: 'error', error: String(err) });
+          }
+        }
+
+        startRecognizer();
+
+        try {
+          if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+              if (!window._syncCanvasSpeechActive) {
+                stream.getTracks().forEach(function(t) { t.stop(); });
+                return;
+              }
+              micStream = stream;
+              var Ctx = window.AudioContext || window.webkitAudioContext;
+              if (!Ctx) return;
+              audioCtx = new Ctx();
+              var src = audioCtx.createMediaStreamSource(stream);
+              var analyser = audioCtx.createAnalyser();
+              analyser.fftSize = 256;
+              src.connect(analyser);
+              var data = new Uint8Array(analyser.frequencyBinCount);
+              levelTimer = setInterval(function() {
+                if (!window._syncCanvasSpeechActive) return;
+                analyser.getByteTimeDomainData(data);
+                var sum = 0;
+                for (var j = 0; j < data.length; j++) {
+                  var v = (data[j] - 128) / 128.0;
+                  sum += v * v;
+                }
+                var rms = Math.sqrt(sum / data.length);
+                var level = Math.min(1.0, rms * 3.5);
+                emit({ type: 'level', level: Number(level.toFixed(2)) });
+              }, 110);
+            }).catch(function() {});
+          }
+        } catch (_) {}
+
+        return JSON.stringify({ ok: true });
+      };
+    })();
   </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>

@@ -18,6 +18,7 @@
     - **AI Skill 读写、SVG 导出与内置 MindFlow MCP Server**：支持一键复制完整 **AI 技能说明书 + 当前画板语义上下文**，直接导入导出标准 `mindflow` v1 JSON 与高清矢量 `.svg`；同时内置符合 Streamable HTTP JSON-RPC 2.0 规范的 **MindFlow MCP Server**（`/api/rooms/<roomId>/mindflow/mcp` + `server/bin/mindflow_mcp.dart` + 零依赖 `scripts/mindflow_mcp_bridge.mjs` stdio 桥），默认 `--read-only` 防误改、`expectedRevision` 乐观并发锁、20 版本自动滚动备份恢复与 WebSocket 多端实时落盘广播。
   - **自由套索多选（`G`）与组合撤销**：自由圈选多笔手写字迹、公式、图形与便签，支持整体拖拽平移、一键批量改色、复制（`Cmd/Ctrl+D`）、删除，且单步 `Cmd/Ctrl+Z` 即可原子回滚整组操作。
   - **笔尾停顿自动拉直（Hold-to-Snap）+ 3 档常用笔预设槽**：手写划线在笔尾停顿约 `0.38s` 即自动拉直为标准直线并支持继续拖动瞄准端点；底部工具栏内置 3 个常用笔/荧光笔预设槽（单击秒切、长按保存当前笔触）。
+  - **悬浮语音备忘（实时转文字 → 完整文字备忘，快捷键 `U`）**：调用各端原生/Web 语音引擎及 **Linux 端侧离线模型（Sherpa-ONNX 实时流式 + whisper.cpp 自定义路径）**实时边说边转写并支持边在 PDF/画板上自由手写批注；结束录音后自动去重、清理口语赘词、智能补全中英标点并提取 `- [ ]` 待办事项，可选一键 AI 润色后生成可协同编辑的画板 Markdown 卡片、便签或 MindFlow 概念词块。
 - **多页笔记本、全文检索与多格式导出**
   - 支持多笔记本与多页树状管理、**跨本全文搜索一键定位跳转**、**页面星标收藏（`⭐` 仅看星标）**、页面复制与上下排序、顶栏 `< 2/5 >` 快速翻页。
   - 纸张底纹涵盖空白 / 方格 / 点阵 / 横线 / **康奈尔笔记** / **错题本** / **日程待办**，支持 **羊皮黄 / 护眼绿 / 深色黑板** 纸色与可开关的 **A4 分页参考界**。
@@ -86,16 +87,16 @@ flutter run -d <你的iPad或iPhone设备ID>
 1. **直接安装发行版包**（可从 GitHub Releases 下载对应架构产物）：
    - **Debian / Ubuntu / Deepin / UOS (`.deb`)**：
      ```bash
-     sudo apt install ./sync-canvas-notebook_1.2.0_amd64.deb   # arm64 架构将 amd64 替换为 arm64
+     sudo apt install ./sync-canvas-notebook_1.3.0_amd64.deb   # arm64 架构将 amd64 替换为 arm64
      ```
    - **Fedora / RHEL / Rocky / Alma / openSUSE (`.rpm`)**：
      ```bash
-     sudo dnf install ./sync-canvas-notebook-1.2.0-1.x86_64.rpm   # arm64 将 x86_64 替换为 aarch64
+     sudo dnf install ./sync-canvas-notebook-1.3.0-1.x86_64.rpm   # arm64 将 x86_64 替换为 aarch64
      ```
    - **通用便携版 (`.AppImage`)**：
      ```bash
-     chmod +x SyncCanvas_Notebook-1.2.0-x86_64.AppImage
-     ./SyncCanvas_Notebook-1.2.0-x86_64.AppImage
+     chmod +x SyncCanvas_Notebook-1.3.0-x86_64.AppImage
+     ./SyncCanvas_Notebook-1.3.0-x86_64.AppImage
      ```
 2. **在 Linux 本机一键打包三种格式**：
    ```bash
@@ -106,12 +107,15 @@ flutter run -d <你的iPad或iPhone设备ID>
    ```bash
    ./scripts/package_linux_docker.sh all   # 支持 amd64 / arm64 / all
    ```
+4. **Linux 端侧离线语音识别模型（实时语音备忘 `U`）**：
+   - 支持 **Sherpa-ONNX 实时流式引擎**（`dart:ffi` 原生调用，支持中/英 Zipformer、Paraformer 等 `.onnx` 模型，内置 **一键下载** 与可选 GitHub 国内加速镜像）以及 **自定义 `whisper.cpp` `.bin/.gguf` 模型路径**。
+   - 通过系统 `pw-record` / `parec` / `arecord` 实时采集 16 kHz PCM 音频，模型与运行时存放于 `~/.local/share/synccanvas/asr/`。
 
 ### 5. Windows 桌面端（`.exe` 安装向导包 / `.zip` 免安装绿色版，支持 `x64` & `arm64`）
 
 1. **下载安装包或绿色便携版**（可从 GitHub Releases 下载对应架构产物）：
-   - **标准安装向导（推荐，`.exe`）**：运行 `SyncCanvas_Notebook_Setup_1.2.0_windows_x64.exe`（Windows ARM 设备请选择 `windows_arm64`），支持免管理员按用户安装并自动创建桌面与开始菜单快捷方式。
-   - **免安装绿色便携版（`.zip`）**：解压 `SyncCanvas_Notebook-1.2.0-windows-x64-portable.zip` 后直接双击 `sync_canvas_notebook.exe` 运行（已随包附带 MSVC C++ 运行时 DLL）。
+   - **标准安装向导（推荐，`.exe`）**：运行 `SyncCanvas_Notebook_Setup_1.3.0_windows_x64.exe`（Windows ARM 设备请选择 `windows_arm64`），支持免管理员按用户安装并自动创建桌面与开始菜单快捷方式。
+   - **免安装绿色便携版（`.zip`）**：解压 `SyncCanvas_Notebook-1.3.0-windows-x64-portable.zip` 后直接双击 `sync_canvas_notebook.exe` 运行（已随包附带 MSVC C++ 运行时 DLL）。
 2. **在 Windows 本机一键打包双格式**：
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_packages.ps1
@@ -139,6 +143,7 @@ flutter run -d <你的iPad或iPhone设备ID>
 | `Tab` | 选中或编辑概念词块时快速向右派生新分支词块并自动连线 |
 | `Cmd/Ctrl + G` | 将选中元素一键编组为 MindFlow 空间群组（Cluster） |
 | `T` / `S` | 插入 Markdown 卡片 / 便签 |
+| `U` | 打开 / 收起悬浮语音备忘录（实时转文字并整理为完整文字备忘） |
 | `L` | 协作激光笔 |
 | `[` / `]` 或 `PageUp` / `PageDown` | 快速切换上一页 / 下一页 |
 | 按住 `Space` + 拖拽 / 滚轮 | 抓手平移 / 缩放画布 |

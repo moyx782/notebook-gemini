@@ -105,6 +105,178 @@ class HotspotStartOutcome {
   final String? error;
 }
 
+enum VoiceSpeechEventType {
+  partial,
+  finalized,
+  level,
+  status,
+  error;
+
+  static VoiceSpeechEventType fromName(String? raw) {
+    for (final v in VoiceSpeechEventType.values) {
+      if (v.name == raw) return v;
+    }
+    return VoiceSpeechEventType.status;
+  }
+}
+
+class VoiceSpeechEvent {
+  const VoiceSpeechEvent({
+    required this.type,
+    this.text = '',
+    this.level = 0.0,
+    this.status = '',
+    this.error,
+  });
+
+  final VoiceSpeechEventType type;
+  final String text;
+  final double level;
+  final String status;
+  final String? error;
+
+  factory VoiceSpeechEvent.fromJson(Map<String, dynamic> json) {
+    return VoiceSpeechEvent(
+      type: VoiceSpeechEventType.fromName(json['type'] as String?),
+      text: json['text'] as String? ?? '',
+      level: (json['level'] as num? ?? 0.0).toDouble().clamp(0.0, 1.0),
+      status: json['status'] as String? ?? '',
+      error: json['error'] as String?,
+    );
+  }
+}
+
+enum LocalAsrEngineKind {
+  sherpaTransducer('Sherpa-ONNX Transducer'),
+  sherpaParaformer('Sherpa-ONNX Paraformer'),
+  sherpaZipformerCtc('Sherpa-ONNX Zipformer CTC'),
+  whisperCli('whisper.cpp CLI'),
+  unknown('未知模型');
+
+  const LocalAsrEngineKind(this.label);
+  final String label;
+}
+
+class LocalAsrModelPreset {
+  const LocalAsrModelPreset({
+    required this.id,
+    required this.name,
+    required this.subtitle,
+    required this.archiveUrl,
+    required this.extractedDirName,
+    required this.sizeLabel,
+    required this.engineKind,
+    this.recommended = false,
+  });
+
+  final String id;
+  final String name;
+  final String subtitle;
+  final String archiveUrl;
+  final String extractedDirName;
+  final String sizeLabel;
+  final LocalAsrEngineKind engineKind;
+  final bool recommended;
+}
+
+const List<LocalAsrModelPreset> kLinuxAsrModelPresets = [
+  LocalAsrModelPreset(
+    id: 'zipformer-zh-14m',
+    name: 'Zipformer 中文轻量流式 (14M)',
+    subtitle: '中文字词流式识别，体积小速度快（推荐）',
+    archiveUrl:
+        'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23.tar.bz2',
+    extractedDirName: 'sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23',
+    sizeLabel: '74 MB',
+    engineKind: LocalAsrEngineKind.sherpaTransducer,
+    recommended: true,
+  ),
+  LocalAsrModelPreset(
+    id: 'zipformer-ctc-multi-zh-int8',
+    name: 'Zipformer CTC 多方言量化 (Int8)',
+    subtitle: '普通话与多方言实时流式量化模型，CPU 占用低',
+    archiveUrl:
+        'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-ctc-multi-zh-hans-int8-2023-12-13.tar.bz2',
+    extractedDirName:
+        'sherpa-onnx-streaming-zipformer-ctc-multi-zh-hans-int8-2023-12-13',
+    sizeLabel: '57 MB',
+    engineKind: LocalAsrEngineKind.sherpaZipformerCtc,
+  ),
+  LocalAsrModelPreset(
+    id: 'zipformer-bilingual-zh-en',
+    name: 'Zipformer 中英双语流式',
+    subtitle: '中英混合技术术语高准确率识别',
+    archiveUrl:
+        'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20-mobile.tar.bz2',
+    extractedDirName:
+        'sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20-mobile',
+    sizeLabel: '347 MB',
+    engineKind: LocalAsrEngineKind.sherpaTransducer,
+  ),
+];
+
+class LocalAsrStatus {
+  const LocalAsrStatus({
+    required this.supported,
+    required this.ready,
+    required this.hasRuntime,
+    required this.hasModel,
+    this.engineKind = LocalAsrEngineKind.unknown,
+    this.engineSummary = '',
+    this.activeModelPath = '',
+    this.activeRuntimePath = '',
+    this.modelsRootDir = '',
+    this.audioTool = '',
+    this.installedPresetIds = const <String>[],
+    this.issueMessage,
+  });
+
+  const LocalAsrStatus.unsupported()
+      : supported = false,
+        ready = false,
+        hasRuntime = false,
+        hasModel = false,
+        engineKind = LocalAsrEngineKind.unknown,
+        engineSummary = '',
+        activeModelPath = '',
+        activeRuntimePath = '',
+        modelsRootDir = '',
+        audioTool = '',
+        installedPresetIds = const <String>[],
+        issueMessage = null;
+
+  final bool supported;
+  final bool ready;
+  final bool hasRuntime;
+  final bool hasModel;
+  final LocalAsrEngineKind engineKind;
+  final String engineSummary;
+  final String activeModelPath;
+  final String activeRuntimePath;
+  final String modelsRootDir;
+  final String audioTool;
+  final List<String> installedPresetIds;
+  final String? issueMessage;
+}
+
+class LocalAsrDownloadProgress {
+  const LocalAsrDownloadProgress({
+    required this.stage,
+    required this.fraction,
+    this.done = false,
+    this.error,
+    this.installedModelPath,
+    this.installedRuntimePath,
+  });
+
+  final String stage;
+  final double? fraction;
+  final bool done;
+  final String? error;
+  final String? installedModelPath;
+  final String? installedRuntimePath;
+}
+
 abstract class PlatformAdapter {
   bool get isWeb;
   bool get canPickImage;
@@ -113,8 +285,11 @@ abstract class PlatformAdapter {
   bool get canHostServer;
   bool get canDiscoverNearby;
   bool get canManageHotspot;
+  bool get canTranscribeSpeech;
+  bool get supportsLocalAsrModels;
 
   Stream<NearbyBoardBeacon> get nearbyBeacons;
+  Stream<VoiceSpeechEvent> get speechEvents;
 
   String defaultWsUrl();
   String? initialRoomFromUrl();
@@ -128,7 +303,12 @@ abstract class PlatformAdapter {
     Uri uri, {
     Duration timeout = const Duration(seconds: 4),
   });
-  Future<HttpResponseData?> httpPostJson(Uri uri, String jsonBody);
+  Future<HttpResponseData?> httpPostJson(
+    Uri uri,
+    String jsonBody, {
+    Map<String, String>? headers,
+    Duration timeout = const Duration(seconds: 15),
+  });
 
   Future<String?> pickImageAsDataUrl();
   Future<PdfImportedDocument?> pickAndRenderPdf({int maxPages = 30});
@@ -140,6 +320,23 @@ abstract class PlatformAdapter {
     Uint8List bytes, {
     String mimeType = 'image/png',
   });
+
+  Future<OperationOutcome> startSpeechRecognition({
+    String localeId = 'zh-CN',
+    String? localModelPath,
+    String? localRuntimePath,
+  });
+  Future<void> stopSpeechRecognition();
+
+  Future<LocalAsrStatus> queryLocalAsrStatus({
+    String? customModelPath,
+    String? customRuntimePath,
+  });
+  Stream<LocalAsrDownloadProgress> installLinuxAsrPreset(
+    LocalAsrModelPreset preset, {
+    bool useMirror = false,
+  });
+  Future<String?> pickLocalAsrPath({required bool directory});
 
   Future<int?> startEmbeddedServer({int preferredPort = 8787});
   Future<void> stopEmbeddedServer();

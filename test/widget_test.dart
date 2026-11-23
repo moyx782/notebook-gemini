@@ -18,10 +18,23 @@ class _FakeAndroidPlatformAdapter implements PlatformAdapter {
 
   final StreamController<NearbyBoardBeacon> beaconStream =
       StreamController<NearbyBoardBeacon>.broadcast();
+  final StreamController<VoiceSpeechEvent> speechStream =
+      StreamController<VoiceSpeechEvent>.broadcast();
 
   bool joinedHotspot = false;
   NearbyBoardBeacon? lastHostBeacon;
   bool serverRunning = false;
+  bool speechListening = false;
+  String? lastSpeechLocale;
+  String? lastLocalModelPath;
+  String? lastLocalRuntimePath;
+  bool simulateLinuxLocalAsr = false;
+  LocalAsrStatus localAsrStatus = const LocalAsrStatus.unsupported();
+  String? fakePickedAsrPath;
+  Stream<LocalAsrDownloadProgress> Function(
+    LocalAsrModelPreset preset, {
+    bool useMirror,
+  })? onInstallLinuxAsrPreset;
   String? lastExportedFilename;
   String? lastExportedText;
   Uint8List? lastExportedBytes;
@@ -48,7 +61,16 @@ class _FakeAndroidPlatformAdapter implements PlatformAdapter {
   bool get canManageHotspot => true;
 
   @override
+  bool get canTranscribeSpeech => true;
+
+  @override
+  bool get supportsLocalAsrModels => simulateLinuxLocalAsr;
+
+  @override
   Stream<NearbyBoardBeacon> get nearbyBeacons => beaconStream.stream;
+
+  @override
+  Stream<VoiceSpeechEvent> get speechEvents => speechStream.stream;
 
   @override
   String defaultWsUrl() => 'ws://127.0.0.1:8787/ws';
@@ -85,8 +107,29 @@ class _FakeAndroidPlatformAdapter implements PlatformAdapter {
   }
 
   @override
-  Future<HttpResponseData?> httpPostJson(Uri uri, String jsonBody) async =>
-      null;
+  Future<HttpResponseData?> httpPostJson(
+    Uri uri,
+    String jsonBody, {
+    Map<String, String>? headers,
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    if (uri.path.endsWith('/chat/completions')) {
+      return HttpResponseData(
+        statusCode: 200,
+        body: jsonEncode(<String, dynamic>{
+          'choices': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'message': <String, dynamic>{
+                'content':
+                    '# 实对称矩阵特征值课堂总结\n\n- 重点推导了矩阵的特征值与实对称矩阵正交对角化定理。\n- 注意构造正交特征向量组。\n\n### 待办跟进\n- [ ] 完成第三章课后习题',
+              },
+            },
+          ],
+        }),
+      );
+    }
+    return null;
+  }
 
   @override
   Future<String?> pickImageAsDataUrl() async => _tinyPngDataUrl;
@@ -199,8 +242,71 @@ class _FakeAndroidPlatformAdapter implements PlatformAdapter {
   Future<void> openSystemHotspotSettings() async {}
 
   @override
+  Future<OperationOutcome> startSpeechRecognition({
+    String localeId = 'zh-CN',
+    String? localModelPath,
+    String? localRuntimePath,
+  }) async {
+    lastSpeechLocale = localeId;
+    lastLocalModelPath = localModelPath;
+    lastLocalRuntimePath = localRuntimePath;
+    speechListening = true;
+    return const OperationOutcome(ok: true);
+  }
+
+  @override
+  Future<void> stopSpeechRecognition() async {
+    speechListening = false;
+  }
+
+  @override
+  Future<LocalAsrStatus> queryLocalAsrStatus({
+    String? customModelPath,
+    String? customRuntimePath,
+  }) async {
+    if (!simulateLinuxLocalAsr) {
+      return const LocalAsrStatus.unsupported();
+    }
+    if (customModelPath != null && customModelPath.trim().isNotEmpty) {
+      return LocalAsrStatus(
+        supported: true,
+        ready: localAsrStatus.hasRuntime,
+        hasRuntime: localAsrStatus.hasRuntime,
+        hasModel: true,
+        engineKind: LocalAsrEngineKind.sherpaTransducer,
+        engineSummary: '自定义测试模型',
+        activeModelPath: customModelPath.trim(),
+        activeRuntimePath:
+            customRuntimePath?.trim().isNotEmpty == true
+                ? customRuntimePath!.trim()
+                : localAsrStatus.activeRuntimePath,
+        modelsRootDir: localAsrStatus.modelsRootDir,
+        audioTool: localAsrStatus.audioTool,
+        installedPresetIds: localAsrStatus.installedPresetIds,
+      );
+    }
+    return localAsrStatus;
+  }
+
+  @override
+  Stream<LocalAsrDownloadProgress> installLinuxAsrPreset(
+    LocalAsrModelPreset preset, {
+    bool useMirror = false,
+  }) {
+    if (onInstallLinuxAsrPreset != null) {
+      return onInstallLinuxAsrPreset!(preset, useMirror: useMirror);
+    }
+    return const Stream<LocalAsrDownloadProgress>.empty();
+  }
+
+  @override
+  Future<String?> pickLocalAsrPath({required bool directory}) async =>
+      fakePickedAsrPath;
+
+  @override
   Future<void> dispose() async {
     await beaconStream.close();
+    await speechStream.close();
   }
 }
 
@@ -1123,6 +1229,290 @@ void main() {
       );
       expect(png, isNotNull);
       expect(png!.isNotEmpty, isTrue);
+    },
+  );
+
+  testWidgets(
+    'Voice memo streams real-time partial & final speech while handwriting on PDF, consolidates into complete memo with optional AI polish, and syncs card to canvas',
+    (WidgetTester tester) async {
+      final adapter = _FakeAndroidPlatformAdapter();
+      addTearDown(adapter.dispose);
+
+      final ctrl = NotebookController(
+        platformAdapter: adapter,
+        initialPeerId: 'voice-memo-peer',
+        initialDisplayName: 'Voice Tester',
+        initialFormFactor: DeviceFormFactor.desktop,
+        autoConnect: false,
+      );
+      addTearDown(ctrl.dispose);
+
+      await tester.binding.setSurfaceSize(const Size(1440, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      await tester.pumpWidget(SyncCanvasApp(controller: ctrl));
+      await tester.pumpAndSettle();
+
+      // 1. Import continuous PDF onto active canvas page
+      await tester.tap(find.byTooltip('导入 PDF 讲义'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('选择 PDF 并导入'));
+      await tester.pumpAndSettle();
+
+      // 2. Open floating Voice Memo studio via toolbar button & start listening
+      final voiceBtn = find.byTooltip('语音备忘实时转写 (U)');
+      expect(voiceBtn, findsOneWidget);
+      await tester.tap(voiceBtn);
+      await tester.pumpAndSettle();
+
+      expect(ctrl.voiceMemoOpen, isTrue);
+      await tester.tap(find.byKey(const ValueKey<String>('toggle-voice-record-btn')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(ctrl.voiceMemoPhase, VoiceMemoPhase.recording);
+      expect(adapter.speechListening, isTrue);
+
+      // 3. Stream live partial hypothesis + RMS audio level
+      adapter.speechStream.add(
+        const VoiceSpeechEvent(type: VoiceSpeechEventType.level, level: 0.72),
+      );
+      adapter.speechStream.add(
+        const VoiceSpeechEvent(
+          type: VoiceSpeechEventType.partial,
+          text: '嗯 今天我们推导',
+        ),
+      );
+      await tester.pump();
+      expect(
+        find.byKey(const ValueKey<String>('voice-memo-live-partial')),
+        findsOneWidget,
+      );
+      expect(find.textContaining('嗯 今天我们推导'), findsOneWidget);
+
+      // 4. Write a freehand stroke on the unobstructed canvas area WHILE recording!
+      ctrl.setTool(CanvasTool.pen);
+      await tester.pump();
+      final countBeforeStroke = ctrl.activeElements.length;
+      final boardCenter = tester.getCenter(find.byType(BoardStage));
+      final strokeGesture =
+          await tester.startGesture(boardCenter + const Offset(220, 40));
+      await strokeGesture.moveBy(const Offset(110, 45));
+      await strokeGesture.up();
+      await tester.pump();
+      expect(ctrl.activeElements.length, countBeforeStroke + 1);
+      expect(ctrl.voiceMemoPhase, VoiceMemoPhase.recording);
+
+      // 5. Emit finalized speech segments + trailing live partial
+      adapter.speechStream.add(
+        const VoiceSpeechEvent(
+          type: VoiceSpeechEventType.finalized,
+          text: '嗯 今天我们推导矩阵的特征值性质',
+        ),
+      );
+      adapter.speechStream.add(
+        const VoiceSpeechEvent(
+          type: VoiceSpeechEventType.finalized,
+          text: '为什么实对称矩阵一定可以对角化呢',
+        ),
+      );
+      adapter.speechStream.add(
+        const VoiceSpeechEvent(
+          type: VoiceSpeechEventType.finalized,
+          text: '下一步记得完成第三章课后习题',
+        ),
+      );
+      adapter.speechStream.add(
+        const VoiceSpeechEvent(
+          type: VoiceSpeechEventType.partial,
+          text: '注意正交特征向量组',
+        ),
+      );
+      await tester.pump();
+
+      // 6. Finish recording -> consolidates into complete formatted text memo
+      final finishBtn = find.byKey(const ValueKey<String>('finish-voice-memo-btn'));
+      await tester.ensureVisible(finishBtn);
+      await tester.tap(finishBtn);
+      await tester.pumpAndSettle();
+
+      expect(ctrl.voiceMemoPhase, VoiceMemoPhase.review);
+      expect(adapter.speechListening, isFalse);
+      expect(ctrl.voiceMemoDraftBody, contains('推导矩阵的特征值性质。'));
+      expect(ctrl.voiceMemoDraftBody, contains('为什么实对称矩阵一定可以对角化呢？'));
+      expect(ctrl.voiceMemoDraftBody, contains('注意正交特征向量组。'));
+      expect(ctrl.voiceMemoDraftBody, contains('- [ ] 完成第三章课后习题'));
+      expect(ctrl.voiceMemoDraftBody, isNot(contains('嗯')));
+
+      // 7. Optional AI polish updates the complete memo text smoothly
+      ctrl.configureVoiceMemoAi(
+        apiBaseUrl: 'https://mock.ai.local/v1',
+        apiKey: 'test-key',
+        modelName: 'gpt-4o-mini',
+      );
+      final aiPolishBtn = find.byKey(const ValueKey<String>('ai-polish-memo-btn'));
+      await tester.ensureVisible(aiPolishBtn);
+      await tester.tap(aiPolishBtn);
+      await tester.pumpAndSettle();
+
+      expect(ctrl.voiceMemoDraftTitle, '实对称矩阵特征值课堂总结');
+      expect(ctrl.voiceMemoDraftBody, contains('实对称矩阵正交对角化定理'));
+      expect(ctrl.voiceMemoDraftBody, contains('- [ ] 完成第三章课后习题'));
+
+      // 8. Commit complete memo to canvas as a synced Markdown card beside PDF
+      final commitBtn =
+          find.byKey(const ValueKey<String>('commit-voice-memo-card-btn'));
+      await tester.ensureVisible(commitBtn);
+      await tester.tap(commitBtn);
+      await tester.pumpAndSettle();
+
+      expect(ctrl.voiceMemoOpen, isFalse);
+      final createdCard = ctrl.activeElements.firstWhere(
+        (e) =>
+            !e.deleted &&
+            e.kind == ElementKind.textCard &&
+            e.text.contains('实对称矩阵正交对角化定理'),
+      );
+      expect(createdCard.x, greaterThanOrEqualTo(920.0));
+
+      // Single-step Undo removes committed memo card cleanly, and Redo restores it
+      ctrl.undo();
+      await tester.pumpAndSettle();
+      expect(ctrl.activeElements.any((e) => e.id == createdCard.id), isFalse);
+
+      ctrl.redo();
+      await tester.pumpAndSettle();
+      expect(ctrl.activeElements.any((e) => e.id == createdCard.id), isTrue);
+    },
+  );
+
+  testWidgets(
+    'Linux voice memo exposes local ASR manager, preset download, and custom model paths',
+    (WidgetTester tester) async {
+      final adapter = _FakeAndroidPlatformAdapter()
+        ..simulateLinuxLocalAsr = true
+        ..localAsrStatus = const LocalAsrStatus(
+          supported: true,
+          ready: false,
+          hasRuntime: false,
+          hasModel: false,
+          modelsRootDir: '/home/test/.local/share/synccanvas/asr',
+          audioTool: 'pw-record (PipeWire)',
+          issueMessage: '尚未下载或配置本地语音模型',
+        )
+        ..onInstallLinuxAsrPreset = (preset, {bool useMirror = false}) {
+          return Stream<LocalAsrDownloadProgress>.fromIterable(
+            <LocalAsrDownloadProgress>[
+              LocalAsrDownloadProgress(
+                stage: '正在下载 ${preset.name}...',
+                fraction: 0.45,
+              ),
+              LocalAsrDownloadProgress(
+                stage: '就绪：${preset.name}',
+                fraction: 1.0,
+                done: true,
+                installedModelPath:
+                    '/home/test/.local/share/synccanvas/asr/models/${preset.extractedDirName}',
+                installedRuntimePath:
+                    '/home/test/.local/share/synccanvas/asr/runtime/lib/libsherpa-onnx-c-api.so',
+              ),
+            ],
+          );
+        };
+
+      addTearDown(adapter.dispose);
+
+      final ctrl = NotebookController(
+        platformAdapter: adapter,
+        initialPeerId: 'test-linux-asr',
+        initialDisplayName: 'Linux 端侧测试',
+        initialFormFactor: DeviceFormFactor.desktop,
+        autoConnect: false,
+      );
+      addTearDown(ctrl.dispose);
+
+      await tester.binding.setSurfaceSize(const Size(1440, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(SyncCanvasApp(controller: ctrl));
+      await tester.pumpAndSettle();
+
+      // Open voice memo panel
+      await tester.tap(find.byTooltip('语音备忘实时转写 (U)'));
+      await tester.pumpAndSettle();
+
+      // Linux local ASR banner and manage button should be visible
+      final manageBtn =
+          find.byKey(const ValueKey<String>('open-linux-asr-model-btn'));
+      expect(manageBtn, findsOneWidget);
+
+      await tester.tap(manageBtn);
+      await tester.pumpAndSettle();
+
+      expect(find.text('Linux 端侧离线语音模型管理'), findsOneWidget);
+
+      // Update fake status right before installing preset so refresh reads installed state
+      adapter.localAsrStatus = LocalAsrStatus(
+        supported: true,
+        ready: true,
+        hasRuntime: true,
+        hasModel: true,
+        engineKind: LocalAsrEngineKind.sherpaTransducer,
+        engineSummary: 'Sherpa-ONNX 流式 Transducer',
+        activeModelPath:
+            '/home/test/.local/share/synccanvas/asr/models/${kLinuxAsrModelPresets.first.extractedDirName}',
+        activeRuntimePath:
+            '/home/test/.local/share/synccanvas/asr/runtime/lib/libsherpa-onnx-c-api.so',
+        modelsRootDir: '/home/test/.local/share/synccanvas/asr',
+        audioTool: 'pw-record (PipeWire)',
+        installedPresetIds: <String>[kLinuxAsrModelPresets.first.id],
+      );
+
+      final presetBtn = find.byKey(
+        ValueKey<String>('install-asr-preset-${kLinuxAsrModelPresets.first.id}'),
+      );
+      await tester.ensureVisible(presetBtn);
+      await tester.tap(presetBtn);
+      await tester.pumpAndSettle();
+
+      expect(
+        ctrl.localAsrModelPath,
+        endsWith(kLinuxAsrModelPresets.first.extractedDirName),
+      );
+      expect(ctrl.localAsrStatus.ready, isTrue);
+
+      // Enter custom whisper .bin model + custom whisper-cli runtime path
+      final modelField = find.byKey(
+        const ValueKey<String>('custom-local-model-path-field'),
+      );
+      final runtimeField = find.byKey(
+        const ValueKey<String>('custom-local-runtime-path-field'),
+      );
+      await tester.ensureVisible(modelField);
+      await tester.enterText(modelField, '/opt/models/ggml-base.bin');
+      await tester.enterText(runtimeField, '/usr/local/bin/whisper-cli');
+
+      final saveBtn = find.byKey(
+        const ValueKey<String>('save-custom-local-asr-btn'),
+      );
+      await tester.ensureVisible(saveBtn);
+      await tester.tap(saveBtn);
+      await tester.pumpAndSettle();
+
+      expect(ctrl.localAsrModelPath, '/opt/models/ggml-base.bin');
+      expect(ctrl.localAsrRuntimePath, '/usr/local/bin/whisper-cli');
+
+      // Starting voice recording passes custom paths to PlatformAdapter
+      await tester.tap(
+        find.byKey(const ValueKey<String>('toggle-voice-record-btn')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(adapter.speechListening, isTrue);
+      expect(adapter.lastLocalModelPath, '/opt/models/ggml-base.bin');
+      expect(adapter.lastLocalRuntimePath, '/usr/local/bin/whisper-cli');
+
+      await ctrl.pauseVoiceMemoRecording();
+      await tester.pumpAndSettle();
     },
   );
 }
